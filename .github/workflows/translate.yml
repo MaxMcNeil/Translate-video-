@@ -1,0 +1,153 @@
+name: Traduire une vidéo
+
+# Lancement manuel uniquement (onglet Actions → Run workflow)
+on:
+  workflow_dispatch:
+    inputs:
+      langues:
+        description: "Langue(s) de sortie : fr, it, ar, en (ex. fr ou fr,en)"
+        required: true
+        default: "fr"
+      voix:
+        description: "Voix off"
+        type: choice
+        options: [homme, femme]
+        default: homme
+      sous_titres:
+        description: "bande = sous l'image (ne cache jamais les visages) / bas = sur l'image / non"
+        type: choice
+        options: [bande, bas, non]
+        default: bande
+      tag:
+        description: "Tag de la release (vide = la plus récente)"
+        required: false
+        default: ""
+      fichier:
+        description: "Nom exact de la vidéo dans la release (vide = la première vidéo)"
+        required: false
+        default: ""
+      langue_source:
+        description: "Langue d'origine (auto, ou ar, it, de, zh, ja…)"
+        required: false
+        default: "auto"
+      volume_original:
+        description: "Volume de la voix originale (0.05 = à peine audible)"
+        required: false
+        default: "0.05"
+      modele_whisper:
+        description: "Précision de la transcription"
+        type: choice
+        options: [medium, small, large-v3]
+        default: medium
+
+permissions:
+  contents: write
+
+concurrency:
+  group: translate-video
+  cancel-in-progress: false
+
+jobs:
+  traduire:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      GH_TOKEN: ${{ github.token }}
+      IN_TAG: ${{ inputs.tag }}
+      IN_FILE: ${{ inputs.fichier }}
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Paquets système (ffmpeg, polices dont l'arabe)
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends ffmpeg fonts-noto-core && break
+            sleep 15
+          done
+          ffmpeg -version | head -1
+
+      - name: Cache des modèles
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            models
+          key: models-v1-${{ inputs.modele_whisper }}
+          restore-keys: models-v1-
+
+      - name: Dépendances Python
+        run: |
+          pip install --retries 5 --index-url https://download.pytorch.org/whl/cpu torch==2.4.1
+          pip install --retries 5 -r requirements.txt
+
+      - name: Moteur de voix Piper
+        run: |
+          if [ ! -x models/piper/piper/piper ]; then
+            mkdir -p models/piper
+            curl -fL --retry 5 --retry-delay 10 -o /tmp/piper.tgz \
+              https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz
+            tar -xzf /tmp/piper.tgz -C models/piper
+          fi
+          test -x models/piper/piper/piper
+
+      - name: Récupérer la vidéo de la release
+        id: get
+        run: |
+          set -euo pipefail
+          TAG="$IN_TAG"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list --exclude-drafts --limit 1 --json tagName -q '.[0].tagName')
+          fi
+          [ -n "$TAG" ] || { echo "::error::Aucune release trouvée. Crée une release avec ta vidéo."; exit 1; }
+          if [ -n "$IN_FILE" ]; then
+            NAME="$IN_FILE"
+          else
+            NAME=$(gh release view "$TAG" --json assets -q '.assets[].name' \
+              | grep -iE '\.(mp4|mov|mkv|webm|m4v|avi)$' \
+              | grep -vE '__(FR|IT|AR|EN)\.mp4$' | head -n1 || true)
+          fi
+          [ -n "$NAME" ] || { echo "::error::Aucune vidéo dans la release $TAG"; exit 1; }
+          mkdir -p in
+          for i in 1 2 3; do gh release download "$TAG" --pattern "$NAME" --dir in --clobber && break; sleep 10; done
+          test -s "in/$NAME"
+          echo "Release : $TAG — vidéo : $NAME"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "file=in/$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Traduire (transcription → traduction → voix off → montage)
+        env:
+          IN_VIDEO: ${{ steps.get.outputs.file }}
+          IN_LANGS: ${{ inputs.langues }}
+          IN_VOICE: ${{ inputs.voix }}
+          IN_SUBS: ${{ inputs.sous_titres }}
+          IN_SRC: ${{ inputs.langue_source }}
+          IN_VOL: ${{ inputs.volume_original }}
+          IN_WHISPER: ${{ inputs.modele_whisper }}
+        run: |
+          python scripts/translate_video.py --input "$IN_VIDEO" --langs "$IN_LANGS" \
+            --voice "$IN_VOICE" --subs "$IN_SUBS" --src "$IN_SRC" \
+            --orig-vol "$IN_VOL" --whisper "$IN_WHISPER" --outdir out
+          ls -la out
+
+      - name: Publier dans la même release
+        env:
+          TAG: ${{ steps.get.outputs.tag }}
+        run: |
+          for i in 1 2 3; do gh release upload "$TAG" out/* --clobber && exit 0; sleep 15; done
+          echo "::warning::Envoi dans la release raté — récupère la vidéo dans les artefacts du run."
+
+      - name: Copie de secours (artefact 7 jours)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-traduite
+          path: out/
+          retention-days: 7
+          if-no-files-found: ignore
