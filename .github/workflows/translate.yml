@@ -30,7 +30,7 @@ on:
         required: false
         default: ""
       fichier:
-        description: "5) Nom d'UNE vidéo précise (ignore le champ 0). Vide = les vidéos de la release dans l'ordre"
+        description: "5) Laisser VIDE. (Sert seulement à traduire UNE vidéo précise par son nom exact ; le champ 0 est alors ignoré)"
         required: false
         default: ""
       langue_source:
@@ -49,13 +49,19 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
-concurrency:
-  group: translate-video
-  cancel-in-progress: false
+# Pas de file d'attente globale : deux lancements ne s'annulent jamais l'un l'autre.
+
+env:
+  HF_HUB_DISABLE_TELEMETRY: "1"
+  HF_HUB_DOWNLOAD_TIMEOUT: "60"
+  HF_HUB_ETAG_TIMEOUT: "20"
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   lister:
+    name: "Vérifier les champs et lister les vidéos"
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
@@ -63,55 +69,94 @@ jobs:
       IN_TAG: ${{ inputs.tag }}
       IN_FILE: ${{ inputs.fichier }}
       IN_N: ${{ inputs.nombre_videos }}
+      IN_LANGS: ${{ inputs.langues }}
+      IN_VOL: ${{ inputs.volume_original }}
+      IN_SRC: ${{ inputs.langue_source }}
     outputs:
       tag: ${{ steps.l.outputs.tag }}
       videos: ${{ steps.l.outputs.videos }}
     steps:
-      - name: Lister les vidéos à traduire
+      - name: Vérifier les champs du formulaire
+        run: |
+          set -euo pipefail
+          err=0
+          LANGS=$(echo "$IN_LANGS" | tr 'A-Z' 'a-z' | tr ';' ',' | tr -d ' ')
+          [ -n "$LANGS" ] || { echo "::error::Champ 1 vide : mets fr, it, ar ou en."; err=1; }
+          for l in ${LANGS//,/ }; do
+            case "$l" in fr|it|ar|en) ;; *) echo "::error::Champ 1 : « $l » n'est pas géré. Choix : fr, it, ar, en."; err=1 ;; esac
+          done
+          N=$(echo "$IN_N" | tr -d ' ' | tr 'A-Z' 'a-z')
+          case "$N" in toutes|tout|all|""|[0-9]|[0-9][0-9]) ;; *) echo "::error::Champ 0 : mets un nombre (1, 2, 3…) ou « toutes »."; err=1 ;; esac
+          python3 -c "import sys; v=float(sys.argv[1].replace(',','.')); assert 0<=v<=1" "$IN_VOL" 2>/dev/null \
+            || { echo "::error::Champ 7 : le volume doit être un nombre entre 0 et 1 (ex. 0.05)."; err=1; }
+          echo "$IN_SRC" | grep -qiE '^\s*(auto|[a-z]{2,3})\s*$' \
+            || { echo "::error::Champ 6 : mets « auto » ou un code de langue (ar, it, de, zh, ja…)."; err=1; }
+          exit $err
+
+      - name: Lister les vidéos de la release
         id: l
         run: |
           set -euo pipefail
-          TAG="$IN_TAG"
-          if [ -z "$TAG" ]; then
-            TAG=$(gh release list -R "$GITHUB_REPOSITORY" --exclude-drafts --limit 1 --json tagName -q '.[0].tagName')
-          fi
-          [ -n "$TAG" ] || { echo "::error::Aucune release trouvée. Crée une release avec ta vidéo."; exit 1; }
-          if [ -n "$IN_FILE" ]; then
-            printf '%s\n' "$IN_FILE" > list.txt
+          R="$GITHUB_REPOSITORY"
+          gh api "repos/$R/releases?per_page=100" > releases.json
+          if [ -n "$IN_TAG" ]; then
+            jq -e --arg t "$IN_TAG" '[.[] | select(.tag_name==$t)][0]' releases.json > rel.json \
+              || { echo "::error::Aucune release avec le tag « $IN_TAG ». Vérifie le champ 4 (ou laisse-le vide)."; exit 1; }
           else
-            gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' \
-              | grep -iE '\.(mp4|mov|mkv|webm|m4v|avi)$' \
-              | grep -vE '__(FR|IT|AR|EN)\.mp4$' > list.txt || true
+            jq -e '[.[] | select(.draft|not)][0]' releases.json > rel.json \
+              || { echo "::error::Aucune release publiée. Crée une release et dépose ta vidéo dedans."; exit 1; }
           fi
-          [ -s list.txt ] || { echo "::error::Aucune vidéo à traduire dans la release $TAG"; exit 1; }
+          TAG=$(jq -r .tag_name rel.json)
+          # vidéos d'origine uniquement (les résultats __FR/__IT/__AR/__EN sont ignorés), dans l'ordre de dépôt
+          jq -c '[.assets | sort_by(.created_at)[]
+                  | select(.name | test("\\.(mp4|mov|mkv|webm|m4v|avi)$"; "i"))
+                  | select(.name | test("__(FR|IT|AR|EN)\\.mp4$") | not)
+                  | {id, name, size, state}]' rel.json > all.json
+          if [ -n "$IN_FILE" ]; then
+            jq -c --arg f "$IN_FILE" '[.[] | select(.name==$f)]' all.json > list.json
+            [ "$(jq length list.json)" -gt 0 ] || { echo "::error::Champ 5 : aucune vidéo nommée « $IN_FILE » dans la release $TAG. Laisse ce champ vide."; exit 1; }
+          else
+            cp all.json list.json
+          fi
+          BROKEN=$(jq -r '.[] | select(.state!="uploaded" or .size==0) | .name' list.json)
+          [ -z "$BROKEN" ] || echo "::warning::Vidéo(s) mal envoyée(s), ignorée(s) : $BROKEN"
+          jq -c '[.[] | select(.state=="uploaded" and .size>0)]' list.json > ok.json
+          TOTAL=$(jq length ok.json)
+          [ "$TOTAL" -gt 0 ] || { echo "::error::Aucune vidéo à traduire dans la release « $TAG »."; exit 1; }
           N=$(echo "$IN_N" | tr -d ' ' | tr 'A-Z' 'a-z')
-          case "$N" in
-            toutes|tout|all|"") N=$(wc -l < list.txt) ;;
-            *[!0-9]*) echo "::error::Champ 0 : mets un nombre (1, 2, 3…) ou « toutes »"; exit 1 ;;
-          esac
+          case "$N" in toutes|tout|all|"") N=$TOTAL ;; esac
           [ "$N" -ge 1 ] || N=1
-          [ "$N" -le 20 ] || N=20
-          head -n "$N" list.txt > sel.txt
-          echo "Release : $TAG"; echo "Vidéos traduites en parallèle :"; cat sel.txt
+          [ "$N" -le 20 ] || { echo "::warning::Maximum 20 vidéos par lancement."; N=20; }
+          [ "$N" -le "$TOTAL" ] || echo "::notice::Tu as demandé $N vidéo(s), la release n'en contient que $TOTAL : toutes seront traduites."
+          jq -c --argjson n "$N" '.[:$n] | map({id, name, size})' ok.json > sel.json
+          {
+            echo "## Lancement"
+            echo "- Release : **$TAG**"
+            echo "- Langue(s) de sortie : **$IN_LANGS** — langue parlée : **$IN_SRC**"
+            echo "- Vidéos traduites en parallèle : **$(jq length sel.json)** sur $TOTAL"
+            echo ""
+            jq -r '.[] | "  - \(.name) (\(.size/1048576|floor) Mo)"' sel.json
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat sel.json
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "videos=$(jq -R -s -c 'split("\n") | map(select(length>0))' sel.txt)" >> "$GITHUB_OUTPUT"
+          echo "videos=$(cat sel.json)" >> "$GITHUB_OUTPUT"
 
   traduire:
     needs: lister
-    name: "Traduire : ${{ matrix.video }}"
+    name: "Traduire : ${{ matrix.name }}"
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 180
     strategy:
       fail-fast: false
-      max-parallel: 10
+      max-parallel: 20
       matrix:
-        video: ${{ fromJSON(needs.lister.outputs.videos) }}
+        include: ${{ fromJSON(needs.lister.outputs.videos) }}
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ needs.lister.outputs.tag }}
-      NAME: ${{ matrix.video }}
-      HF_HUB_DISABLE_TELEMETRY: "1"
-      PYTHONUNBUFFERED: "1"
+      NAME: ${{ matrix.name }}
+      ASSET_ID: ${{ matrix.id }}
+      ASSET_SIZE: ${{ matrix.size }}
     steps:
       - uses: actions/checkout@v4
 
@@ -121,12 +166,15 @@ jobs:
           cache: pip
 
       - name: Paquets système (ffmpeg, polices dont l'arabe)
+        timeout-minutes: 15
         run: |
-          for i in 1 2 3; do
+          for i in 1 2 3 4; do
             sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends ffmpeg fonts-noto-core && break
-            sleep 15
+            echo "apt : essai $i raté, nouvel essai"; sleep $((15 * i))
           done
           ffmpeg -version | head -1
+          fc-list | grep -q "Noto Sans Arabic" || echo "::warning::Police arabe absente"
+          df -h / | tail -1
 
       - name: Cache des modèles
         uses: actions/cache@v4
@@ -134,39 +182,49 @@ jobs:
           path: |
             ~/.cache/huggingface
             models
-          key: models-v1-${{ inputs.modele_whisper }}
-          restore-keys: models-v1-
+          key: models-v2-${{ inputs.modele_whisper }}
+          restore-keys: models-v2-
 
       - name: Dépendances Python
+        timeout-minutes: 25
         run: |
-          pip install --retries 5 --index-url https://download.pytorch.org/whl/cpu torch==2.4.1
-          pip install --retries 5 -r requirements.txt
+          for i in 1 2 3; do
+            pip install --retries 5 --timeout 60 --index-url https://download.pytorch.org/whl/cpu torch==2.4.1 \
+              && pip install --retries 5 --timeout 60 -r requirements.txt && break
+            echo "pip : essai $i raté, nouvel essai"; sleep $((20 * i))
+            [ "$i" = 3 ] && { echo "::error::Installation des dépendances Python impossible."; exit 1; }
+          done
+          python -c "import faster_whisper, transformers, torch, soundfile; print('dépendances OK')"
 
       - name: Moteur de voix Piper
+        timeout-minutes: 10
         run: |
           if [ ! -x models/piper/piper/piper ]; then
-            mkdir -p models/piper
-            curl -fL --retry 5 --retry-delay 10 -o /tmp/piper.tgz \
+            rm -rf models/piper; mkdir -p models/piper
+            curl -fL --retry 6 --retry-delay 10 --retry-all-errors -o /tmp/piper.tgz \
               https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz
             tar -xzf /tmp/piper.tgz -C models/piper
           fi
-          test -x models/piper/piper/piper
+          test -x models/piper/piper/piper || { echo "::error::Piper introuvable après installation."; exit 1; }
 
-      - name: Récupérer la vidéo de la release
+      - name: Télécharger la vidéo
         id: get
+        timeout-minutes: 20
         run: |
-          set -euo pipefail
+          set -uo pipefail
           mkdir -p in
-          ok=0
+          F="in/$NAME"
           for i in 1 2 3 4; do
-            gh release download "$TAG" -R "$GITHUB_REPOSITORY" --pattern "$NAME" --dir in --clobber && ok=1 && break
-            sleep $((10 * i))
+            gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID" > "$F" \
+              && [ "$(stat -c %s "$F")" = "$ASSET_SIZE" ] && break
+            echo "Téléchargement : essai $i raté ou incomplet, nouvel essai"; sleep $((10 * i))
+            [ "$i" = 4 ] && { echo "::error::Impossible de télécharger « $NAME » complètement depuis la release $TAG."; exit 1; }
           done
-          [ "$ok" = 1 ] && test -s "in/$NAME" || { echo "::error::Impossible de télécharger « $NAME » depuis la release $TAG"; exit 1; }
-          echo "Release : $TAG — vidéo : $NAME"
-          echo "file=in/$NAME" >> "$GITHUB_OUTPUT"
+          echo "Release : $TAG — vidéo : $NAME ($(du -h "$F" | cut -f1))"
+          echo "file=$F" >> "$GITHUB_OUTPUT"
 
       - name: Traduire (transcription → traduction → voix off → montage)
+        timeout-minutes: 140
         env:
           IN_VIDEO: ${{ steps.get.outputs.file }}
           IN_LANGS: ${{ inputs.langues }}
@@ -183,19 +241,61 @@ jobs:
           esac
           python scripts/translate_video.py --input "$IN_VIDEO" --langs "$IN_LANGS" \
             --voice "$IN_VOICE" --subs "$SUBS" --src "$IN_SRC" \
-            --orig-vol "$IN_VOL" --whisper "$IN_WHISPER" --outdir out
+            --orig-vol "${IN_VOL//,/.}" --whisper "$IN_WHISPER" --outdir out
           ls -la out
 
       - name: Publier dans la même release
+        timeout-minutes: 20
         run: |
-          for i in 1 2 3 4; do gh release upload "$TAG" out/* -R "$GITHUB_REPOSITORY" --clobber && exit 0; sleep $((15 * i)); done
-          echo "::warning::Envoi dans la release raté — récupère la vidéo dans les artefacts du run."
+          shopt -s nullglob
+          FILES=(out/*.mp4 out/*.srt out/*.txt)
+          [ ${#FILES[@]} -gt 0 ] || { echo "::error::Aucun fichier à publier."; exit 1; }
+          for i in 1 2 3 4; do
+            gh release upload "$TAG" "${FILES[@]}" -R "$GITHUB_REPOSITORY" --clobber && { printf 'Publié : %s\n' "${FILES[@]}"; exit 0; }
+            echo "Envoi : essai $i raté, nouvel essai"; sleep $((15 * i))
+          done
+          echo "::error::Envoi dans la release impossible. La vidéo traduite est dans les artefacts de ce run (7 jours)."
+          exit 1
 
-      - name: Copie de secours (artefact 7 jours)
+      - name: Copie de secours + rapport (artefact 7 jours)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: video-traduite-${{ strategy.job-index }}
+          name: resultat-${{ strategy.job-index }}
           path: out/
           retention-days: 7
           if-no-files-found: ignore
+
+  bilan:
+    name: "Bilan"
+    needs: [lister, traduire]
+    if: always() && needs.lister.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.lister.outputs.tag }}
+    steps:
+      - name: Bilan du lancement
+        run: |
+          R="$GITHUB_REPOSITORY"
+          gh api "repos/$R/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
+            -q '.jobs[] | select(.name | startswith("Traduire")) | [.name, (.conclusion // .status)] | @tsv' > jobs.tsv || true
+          OK=$(grep -c $'\tsuccess$' jobs.tsv || true)
+          TOT=$(wc -l < jobs.tsv)
+          {
+            echo "## Bilan : $OK / $TOT vidéo(s) traduite(s)"
+            echo ""
+            echo "| Vidéo | Résultat |"
+            echo "|---|---|"
+            while IFS=$'\t' read -r n c; do
+              case "$c" in success) e="✅ réussie";; failure) e="❌ échec (voir le détail du job)";; cancelled) e="⏹ annulée";; *) e="$c";; esac
+              echo "| ${n#Traduire : } | $e |"
+            done < jobs.tsv
+            echo ""
+            echo "Fichiers maintenant dans la release **$TAG** :"
+            gh api "repos/$R/releases?per_page=100" | jq -r --arg t "$TAG" \
+              '.[] | select(.tag_name==$t) | .assets[] | "- \(.name) (\(.size/1048576*10|floor/10) Mo)"'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+          [ "$OK" = "$TOT" ] || { echo "::error::$((TOT - OK)) vidéo(s) en échec — voir le tableau du bilan."; exit 1; }

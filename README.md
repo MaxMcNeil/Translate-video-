@@ -15,7 +15,7 @@ Traduit une vidéo (arabe, italien, allemand, chinois, japonais… 40 langues) e
 | 2) Voix off | homme / femme |
 | 3) Sous-titres | **sous l'image** : bande noire ajoutée en bas, l'image n'est jamais recouverte · **sur l'image** : texte posé en bas de la vidéo, sans bande · **aucun** : pas de sous-titres incrustés (le fichier .srt est quand même fourni) |
 | 4) Tag | Vide = dernière release |
-| 5) Nom de la vidéo | Pour traduire UNE vidéo précise (le champ 0 est alors ignoré). Vide = les vidéos de la release dans l'ordre |
+| 5) Nom de la vidéo | Laisser **vide**. Sert seulement à traduire UNE vidéo précise (le champ 0 est alors ignoré) |
 | 6) Langue PARLÉE | Laisser `auto` (détection automatique). À forcer (`ar`, `de`, `zh`…) seulement si la détection se trompe |
 | 7) Volume d'origine | 0.05 = à peine audible |
 | 8) Qualité | `medium` conseillé |
@@ -28,3 +28,12 @@ Traduit une vidéo (arabe, italien, allemand, chinois, japonais… 40 langues) e
 - **Sous-titres** dans une bande noire ajoutée sous l'image → ils ne cachent jamais les visages.
 
 Lancement manuel uniquement, aucune exécution automatique.
+
+## Fiabilité et suivi
+- **Champs vérifiés avant de démarrer** : une erreur de saisie s'affiche en clair en 10 secondes, sans lancer de traduction.
+- **Une machine par vidéo** : si une vidéo échoue, les autres continuent.
+- **Réessais automatiques** sur chaque téléchargement, installation et envoi. Les modèles sont mis en cache.
+- **Une phrase dont la voix échoue est sautée** (son sous-titre reste) au lieu de faire planter la vidéo.
+- **Contrôle final** : la durée et le son de la vidéo produite sont vérifiés avant publication.
+- **Traçable** : chaque job affiche un tableau (langue détectée, phrases, accélérations, retards, durée de chaque étape, avertissements). Un **Bilan** récapitule toutes les vidéos à la fin du run. Le rapport détaillé `rapport_….json` et une copie de la vidéo sont dans les artefacts du run pendant 7 jours.
+- **Refus clairs** : vidéo sans son, muette, corrompue, sans parole ou de plus de 15 min → message d'erreur qui dit quoi faire.
