@@ -157,9 +157,9 @@ jobs:
       ASSET_ID: ${{ matrix.id }}
       ASSET_SIZE: ${{ matrix.size }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -176,7 +176,7 @@ jobs:
           df -h / | tail -1
 
       - name: Cache des modèles
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cache/huggingface
@@ -260,7 +260,7 @@ jobs:
 
       - name: Copie de secours + rapport (artefact 7 jours)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: resultat-${{ strategy.job-index }}
           path: out/

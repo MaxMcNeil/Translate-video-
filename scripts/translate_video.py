@@ -69,6 +69,10 @@ NLLB = {
     "yue": "yue_Hant",
 }
 
+# Langues probables en entrée : une langue rare n'est retenue que si Whisper en est vraiment sûr
+COMMON_LANGS = {"en", "fr", "it", "ar", "de", "es", "pt", "zh", "ja", "ko", "ru", "tr", "nl", "pl",
+                "uk", "fa", "he", "hi", "ur", "ro", "el", "sv", "id", "vi", "th", "ms", "bn"}
+
 SENT_END = re.compile(r"[.!?。！？؟…]['\"»”）)]*$")
 SOFT_END = re.compile(r"[,;:，、؛،]['\"»”）)]*$")
 # « U.S. », « Mr. », « Dr. », « etc. », chiffres « 3. » … : un point qui ne termine pas une phrase
@@ -211,27 +215,61 @@ def transcribe(video, work, model_size, src):
     model = hf_load(f"Whisper {model_size}", lambda local: WhisperModel(
         model_size, device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 2,
         local_files_only=local))
-    segs, info = model.transcribe(
-        str(wav), language=None if src == "auto" else src, vad_filter=True,
-        word_timestamps=True, beam_size=5, condition_on_previous_text=False)
-    words, dropped = [], 0
-    for s in segs:
-        # Hallucinations typiques de Whisper (silence, musique, « merci d'avoir regardé »…)
-        if (s.no_speech_prob > 0.6 and s.avg_logprob < -1.0) or s.compression_ratio > 2.6:
-            dropped += 1
-            continue
-        for w in (s.words or []):
-            if w.word.strip() and w.end > w.start:
-                words.append({"start": float(w.start), "end": float(w.end), "word": w.word})
-    lang = info.language if src == "auto" else src
-    prob = float(info.language_probability or 0)
-    REPORT.update(langue_source=lang, langue_source_proba=round(prob, 2),
-                  langue_source_mode=src, mots=len(words), segments_ecartes=dropped)
+
+    def one_pass(lang):
+        segs, info = model.transcribe(
+            str(wav), language=lang, vad_filter=True, word_timestamps=True, beam_size=5,
+            condition_on_previous_text=False)
+        words, dropped, lps = [], 0, []
+        for s in segs:
+            # Hallucinations typiques de Whisper (silence, musique, boucles « mot mot mot… »)
+            if (s.no_speech_prob > 0.6 and s.avg_logprob < -1.0) or s.compression_ratio > 2.4:
+                dropped += 1
+                continue
+            lps.append(s.avg_logprob)
+            for w in (s.words or []):
+                if w.word.strip() and w.end > w.start:
+                    words.append({"start": float(w.start), "end": float(w.end), "word": w.word})
+        toks = [w["word"].strip().lower() for w in words]
+        rep = sum(1 for i in range(1, len(toks)) if toks[i] == toks[i - 1]) / max(len(toks), 1)
+        score = (float(np.mean(lps)) if lps else -9.0) - 2.0 * rep - 0.05 * dropped
+        return {"lang": lang or info.language, "info": info, "words": words, "dropped": dropped,
+                "rep": rep, "score": score}
+
+    if src != "auto":
+        best = one_pass(src)
+        prob, cands = 1.0, [(src, 1.0)]
+    else:
+        # 1) Whisper propose ses langues ; on corrige les confusions classiques
+        #    (accent britannique → gallois, etc.) en favorisant les langues courantes.
+        first = one_pass(None)
+        probs = dict(first["info"].all_language_probs or [(first["lang"], 1.0)])
+        cands = sorted(probs.items(), key=lambda kv: kv[1] * (1.0 if kv[0] in COMMON_LANGS else 0.15),
+                       reverse=True)[:3]
+        log("Langues candidates : " + ", ".join(f"{l} {p:.0%}" for l, p in cands))
+        best = first if cands[0][0] == first["lang"] else one_pass(cands[0][0])
+        # 2) transcription douteuse (boucles, faible confiance) → on essaie la candidate suivante
+        if (best["rep"] > 0.12 or best["score"] < -1.0) and len(cands) > 1:
+            alt_lang = next(l for l, _ in cands if l != best["lang"])
+            alt = one_pass(alt_lang)
+            log(f"Transcription douteuse en « {best['lang']} » (score {best['score']:.2f}) → essai en "
+                f"« {alt_lang} » (score {alt['score']:.2f})")
+            if alt["score"] > best["score"]:
+                best = alt
+        prob = probs.get(best["lang"], 0.0)
+        if best["lang"] != first["lang"]:
+            warn(f"Langue corrigée : Whisper proposait « {first['lang']} », retenu « {best['lang']} ».")
+    words, lang, dropped = best["words"], best["lang"], best["dropped"]
+    REPORT.update(langue_source=lang, langue_source_proba=round(prob, 2), langue_source_mode=src,
+                  langues_candidates=[[l, round(p, 2)] for l, p in cands],
+                  mots=len(words), segments_ecartes=dropped, score_transcription=round(best["score"], 2))
     log(f"Langue source : {lang} (certitude {prob:.0%}{', forcée' if src != 'auto' else ''}), "
-        f"{len(words)} mots, {dropped} passage(s) douteux écarté(s)")
+        f"{len(words)} mots, {dropped} passage(s) douteux écarté(s), score {best['score']:.2f}")
     if src == "auto" and prob < 0.5:
         warn(f"Détection de langue peu sûre ({lang}, {prob:.0%}). Si le résultat est faux, "
              "relance en remplissant le champ « Langue PARLÉE ».")
+    if best["score"] < -1.2:
+        warn("Transcription de qualité faible (son difficile ?) : vérifie le fichier transcription.")
     del model
     gc.collect()
     return words, lang
@@ -268,6 +306,7 @@ def resegment(words, soft=7.0, hard=12.0, gap=0.7):
     out = []
     for g in groups:
         text = re.sub(r"\s+", " ", "".join(x["word"] for x in g)).strip()
+        text = re.sub(r"\b(\w+)(?:\s+\1\b){2,}", r"\1", text, flags=re.I)  # « mot mot mot » → « mot »
         if text and re.search(r"\w", text):
             out.append({"start": g[0]["start"], "end": g[-1]["end"], "text": text})
     return out
