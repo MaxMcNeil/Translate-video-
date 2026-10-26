@@ -21,12 +21,16 @@ on:
           - "sur l'image (en bas, peut cacher le menton)"
           - "aucun"
         default: "sous l'image (bande noire, visages jamais cachés)"
+      nombre_videos:
+        description: "0) Combien de vidéos de la release traduire EN MÊME TEMPS : 1, 2, 3… ou toutes"
+        required: true
+        default: "1"
       tag:
         description: "4) Tag de la release où est la vidéo. Vide = la release la plus récente"
         required: false
         default: ""
       fichier:
-        description: "5) Nom de la vidéo dans la release. Vide = la 1re vidéo trouvée"
+        description: "5) Nom d'UNE vidéo précise (ignore le champ 0). Vide = les vidéos de la release dans l'ordre"
         required: false
         default: ""
       langue_source:
@@ -51,13 +55,61 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  traduire:
+  lister:
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 10
     env:
       GH_TOKEN: ${{ github.token }}
       IN_TAG: ${{ inputs.tag }}
       IN_FILE: ${{ inputs.fichier }}
+      IN_N: ${{ inputs.nombre_videos }}
+    outputs:
+      tag: ${{ steps.l.outputs.tag }}
+      videos: ${{ steps.l.outputs.videos }}
+    steps:
+      - name: Lister les vidéos à traduire
+        id: l
+        run: |
+          set -euo pipefail
+          TAG="$IN_TAG"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list -R "$GITHUB_REPOSITORY" --exclude-drafts --limit 1 --json tagName -q '.[0].tagName')
+          fi
+          [ -n "$TAG" ] || { echo "::error::Aucune release trouvée. Crée une release avec ta vidéo."; exit 1; }
+          if [ -n "$IN_FILE" ]; then
+            printf '%s\n' "$IN_FILE" > list.txt
+          else
+            gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' \
+              | grep -iE '\.(mp4|mov|mkv|webm|m4v|avi)$' \
+              | grep -vE '__(FR|IT|AR|EN)\.mp4$' > list.txt || true
+          fi
+          [ -s list.txt ] || { echo "::error::Aucune vidéo à traduire dans la release $TAG"; exit 1; }
+          N=$(echo "$IN_N" | tr -d ' ' | tr 'A-Z' 'a-z')
+          case "$N" in
+            toutes|tout|all|"") N=$(wc -l < list.txt) ;;
+            *[!0-9]*) echo "::error::Champ 0 : mets un nombre (1, 2, 3…) ou « toutes »"; exit 1 ;;
+          esac
+          [ "$N" -ge 1 ] || N=1
+          [ "$N" -le 20 ] || N=20
+          head -n "$N" list.txt > sel.txt
+          echo "Release : $TAG"; echo "Vidéos traduites en parallèle :"; cat sel.txt
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "videos=$(jq -R -s -c 'split("\n") | map(select(length>0))' sel.txt)" >> "$GITHUB_OUTPUT"
+
+  traduire:
+    needs: lister
+    name: "Traduire : ${{ matrix.video }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        video: ${{ fromJSON(needs.lister.outputs.videos) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.lister.outputs.tag }}
+      NAME: ${{ matrix.video }}
       HF_HUB_DISABLE_TELEMETRY: "1"
       PYTHONUNBUFFERED: "1"
     steps:
@@ -104,24 +156,14 @@ jobs:
         id: get
         run: |
           set -euo pipefail
-          TAG="$IN_TAG"
-          if [ -z "$TAG" ]; then
-            TAG=$(gh release list --exclude-drafts --limit 1 --json tagName -q '.[0].tagName')
-          fi
-          [ -n "$TAG" ] || { echo "::error::Aucune release trouvée. Crée une release avec ta vidéo."; exit 1; }
-          if [ -n "$IN_FILE" ]; then
-            NAME="$IN_FILE"
-          else
-            NAME=$(gh release view "$TAG" --json assets -q '.assets[].name' \
-              | grep -iE '\.(mp4|mov|mkv|webm|m4v|avi)$' \
-              | grep -vE '__(FR|IT|AR|EN)\.mp4$' | head -n1 || true)
-          fi
-          [ -n "$NAME" ] || { echo "::error::Aucune vidéo dans la release $TAG"; exit 1; }
           mkdir -p in
-          for i in 1 2 3; do gh release download "$TAG" --pattern "$NAME" --dir in --clobber && break; sleep 10; done
-          test -s "in/$NAME"
+          ok=0
+          for i in 1 2 3 4; do
+            gh release download "$TAG" -R "$GITHUB_REPOSITORY" --pattern "$NAME" --dir in --clobber && ok=1 && break
+            sleep $((10 * i))
+          done
+          [ "$ok" = 1 ] && test -s "in/$NAME" || { echo "::error::Impossible de télécharger « $NAME » depuis la release $TAG"; exit 1; }
           echo "Release : $TAG — vidéo : $NAME"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "file=in/$NAME" >> "$GITHUB_OUTPUT"
 
       - name: Traduire (transcription → traduction → voix off → montage)
@@ -145,17 +187,15 @@ jobs:
           ls -la out
 
       - name: Publier dans la même release
-        env:
-          TAG: ${{ steps.get.outputs.tag }}
         run: |
-          for i in 1 2 3; do gh release upload "$TAG" out/* --clobber && exit 0; sleep 15; done
+          for i in 1 2 3 4; do gh release upload "$TAG" out/* -R "$GITHUB_REPOSITORY" --clobber && exit 0; sleep $((15 * i)); done
           echo "::warning::Envoi dans la release raté — récupère la vidéo dans les artefacts du run."
 
       - name: Copie de secours (artefact 7 jours)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: video-traduite
+          name: video-traduite-${{ strategy.job-index }}
           path: out/
           retention-days: 7
           if-no-files-found: ignore

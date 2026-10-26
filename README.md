@@ -10,11 +10,12 @@ Traduit une vidéo (arabe, italien, allemand, chinois, japonais… 40 langues) e
 ## Les champs du formulaire
 | Champ | Ce qu'il faut mettre |
 |---|---|
+| 0) Nombre de vidéos | Combien de vidéos de la release traduire en même temps : `1`, `3`… ou `toutes`. Chaque vidéo tourne sur sa propre machine, en parallèle ; si une échoue, les autres continuent |
 | 1) Langue de SORTIE | La langue dans laquelle tu veux la vidéo : `fr`, `it`, `ar`, `en` (ou `fr,en`) |
 | 2) Voix off | homme / femme |
 | 3) Sous-titres | **sous l'image** : bande noire ajoutée en bas, l'image n'est jamais recouverte · **sur l'image** : texte posé en bas de la vidéo, sans bande · **aucun** : pas de sous-titres incrustés (le fichier .srt est quand même fourni) |
 | 4) Tag | Vide = dernière release |
-| 5) Nom de la vidéo | Vide = première vidéo de la release |
+| 5) Nom de la vidéo | Pour traduire UNE vidéo précise (le champ 0 est alors ignoré). Vide = les vidéos de la release dans l'ordre |
 | 6) Langue PARLÉE | Laisser `auto` (détection automatique). À forcer (`ar`, `de`, `zh`…) seulement si la détection se trompe |
 | 7) Volume d'origine | 0.05 = à peine audible |
 | 8) Qualité | `medium` conseillé |
