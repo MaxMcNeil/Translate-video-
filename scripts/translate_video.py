@@ -351,6 +351,75 @@ def translate(texts, src, tgt):
     return out
 
 
+# ------------------------------------------------------- homme / femme
+F0_SPLIT = 165.0   # Hz : en dessous voix d'homme, au-dessus voix de femme (adultes)
+
+
+def assign_voices(vocals, work, segs, forced):
+    """Choisit la voix off (homme / femme) d'après la hauteur de la voix d'origine.
+    Une seule personne → une seule voix pour toute la vidéo ; plusieurs personnes de sexes
+    différents (interview) → la voix suit chaque phrase."""
+    if forced in ("homme", "femme"):
+        for s in segs:
+            s["voix"] = forced
+        log(f"Voix off imposée : {forced}")
+        return {"voix": forced, "voix_mode": "imposée"}
+    for s in segs:
+        s["voix"] = "homme"
+    try:
+        import librosa
+        src = work / "pitch16.wav"
+        run(["ffmpeg", "-y", "-v", "error", "-i", vocals or (work / "audio16.wav"),
+             "-ac", "1", "-ar", "16000", "-af", "highpass=f=60,lowpass=f=1200", src])
+        y, sr = sf.read(src, dtype="float32")
+        hop = 160  # 10 ms
+        f0 = librosa.yin(y, fmin=65, fmax=400, sr=sr, frame_length=1024, hop_length=hop)
+        rms = librosa.feature.rms(y=y, frame_length=1024, hop_length=hop)[0][:f0.size]
+        loud = rms > max(float(np.percentile(rms, 95)) * 0.18, 1e-4)
+        labels, meds = [], []
+        for s in segs:
+            a, b = int(s["start"] * sr / hop), int(s["end"] * sr / hop)
+            fr = f0[a:b][loud[a:b]]
+            fr = fr[(fr > 70) & (fr < 380)]
+            if fr.size < 30:          # phrase trop courte / pas assez de voix nette
+                labels.append(None)
+                meds.append(None)
+                continue
+            m = float(np.median(fr))
+            meds.append(m)
+            labels.append("femme" if m >= F0_SPLIT else "homme")
+        known = [l for l in labels if l]
+        if not known:
+            warn("Sexe de la voix non déterminable : voix d'homme par défaut. "
+                 "Tu peux l'imposer avec le champ « Voix off ».")
+            return {"voix": "homme (par défaut)", "voix_mode": "auto-échec"}
+        valid = [m for m in meds if m]
+        global_med = float(np.median(valid))
+        share_f = known.count("femme") / len(known)
+        if share_f >= 0.8 or share_f <= 0.2:
+            g = "femme" if share_f >= 0.5 else "homme"
+            for s in segs:
+                s["voix"] = g
+            info = {"voix": g, "voix_mode": "auto (une personne)"}
+            if abs(global_med - F0_SPLIT) < 12:
+                warn(f"Voix à la limite homme/femme ({global_med:.0f} Hz) : « {g} » retenu. "
+                     "Si c'est faux, impose la voix dans le champ « Voix off ».")
+        else:
+            # plusieurs personnes : la voix suit chaque phrase ; phrase indécise → voisine
+            last = known[0]
+            for s, l in zip(segs, labels):
+                last = l or last
+                s["voix"] = last
+            info = {"voix": "homme + femme (selon la phrase)", "voix_mode": "auto (plusieurs personnes)"}
+        info.update(hauteur_voix_hz=round(global_med), part_phrases_femme=round(share_f, 2))
+        log(f"Voix d'origine : hauteur médiane {global_med:.0f} Hz, {share_f:.0%} des phrases "
+            f"féminines → voix off « {info['voix']} »")
+        return info
+    except Exception as e:
+        warn(f"Détection homme/femme impossible ({e}) : voix d'homme par défaut.")
+        return {"voix": "homme (par défaut)", "voix_mode": "auto-échec"}
+
+
 # ------------------------------------------------------------------- voix
 def voice_model(lang, gender):
     rel = VOICES[lang][gender]
@@ -410,7 +479,7 @@ def trim_silence(a, thr_db=-42):
     return a[max(idx[0] - int(0.01 * SR), 0):min(idx[-1] + int(0.04 * SR), a.size)]
 
 
-def build_dub(segs, texts, model, video_dur, work):
+def build_dub(segs, texts, models, video_dur, work):
     """Chaque phrase démarre quand la personne parle ; le débit s'adapte pour finir avec elle.
     Si la voix prend du retard, l'accélération autorisée augmente pour rattraper."""
     track = np.zeros(int((video_dur + 2) * SR), dtype=np.float32)
@@ -431,6 +500,7 @@ def build_dub(segs, texts, model, video_dur, work):
         target = max(min(seg["end"], nxt) - pos, 0.35)
         raw = work / f"tts_{i:04d}.wav"
         try:
+            model = models[seg.get("voix", "homme")]
             piper(say, model, raw, 1.0)
             d0 = sf.info(raw).duration
             ls = min(max(target / max(d0, 0.05), 0.74), 1.12)
@@ -771,6 +841,7 @@ def write_report(outdir, stem):
           f"| Langue parlée | {r.get('langue_source', '?')} (certitude {r.get('langue_source_proba', '?')}) |",
           f"| Musique de fond | {'détectée → supprimée' if r.get('musique_detectee') else 'absente'} "
           f"(séparation : {r.get('separation', '?')}) |",
+          f"| Voix off | {r.get('voix', '?')} ({r.get('voix_mode', '?')}, voix d'origine ≈ {r.get('hauteur_voix_hz', '?')} Hz) |",
           f"| Mots transcrits | {r.get('mots', '?')} — phrases : {r.get('phrases', '?')} |"]
     for lang, s in r.get("sorties", {}).items():
         L.append(f"| Sortie {lang.upper()} | {s.get('fichier')} — {s.get('phrases')} phrases doublées, "
@@ -790,7 +861,7 @@ def main():
     ap.add_argument("--input", required=True)
     ap.add_argument("--langs", default="fr")
     ap.add_argument("--src", default="auto")
-    ap.add_argument("--voice", default="homme", choices=["homme", "femme"])
+    ap.add_argument("--voice", default="auto", choices=["auto", "homme", "femme"])
     ap.add_argument("--subs", default="bandeau", choices=["bandeau", "bande", "bas", "non"])
     ap.add_argument("--orig-vol", type=float, default=0.05)
     ap.add_argument("--whisper", default="medium")
@@ -848,6 +919,8 @@ def main():
         (outdir / f"{stem}__transcription_{src}.txt").write_text(
             "\n".join(f"[{s['start']:.1f}] {s['text']}" for s in segs), encoding="utf-8")
         log(f"{len(segs)} phrases")
+        voix_info = assign_voices(vocals, work, segs, a.voice)
+        REPORT.update(voix_info)
         orig_voice = build_orig_voice(vocals, segs, geo["dur"], work) if vocals and a.orig_vol > 0 else None
         lay = layout(geo, mode)
 
@@ -856,11 +929,12 @@ def main():
             texts = [clean_for_tts(t) for t in translate([s["text"] for s in segs], src, lang)]
             if not any(texts):
                 fail("la traduction n'a rien produit.")
-            stage(f"5. Voix off {lang.upper()} ({a.voice})")
-            model = voice_model(lang, a.voice)
-            if lang == "ar" and a.voice == "femme":
-                warn("Pas de voix féminine arabe disponible : voix masculine utilisée.")
-            dub, timing, st = build_dub(segs, texts, model, geo["dur"], work)
+            stage(f"5. Voix off {lang.upper()} ({voix_info['voix']})")
+            needed = sorted({s["voix"] for s in segs})
+            models = {g: voice_model(lang, g) for g in needed}
+            if lang == "ar" and "femme" in needed:
+                warn("Pas de voix féminine arabe disponible : voix masculine utilisée pour l'arabe.")
+            dub, timing, st = build_dub(segs, texts, models, geo["dur"], work)
             stage(f"6. Sous-titres karaoké {lang.upper()} ({mode})")
             check_fonts(lang)
             cues = build_cues(texts, timing, line_chars_for(geo, lay))

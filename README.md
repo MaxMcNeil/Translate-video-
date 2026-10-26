@@ -12,7 +12,7 @@ Traduit une vidéo (arabe, italien, allemand, chinois, japonais… 40 langues) e
 |---|---|
 | 0) Nombre de vidéos | Combien de vidéos de la release traduire en même temps : `1`, `3`… ou `toutes`. Chaque vidéo tourne sur sa propre machine, en parallèle ; si une échoue, les autres continuent |
 | 1) Langue de SORTIE | La langue dans laquelle tu veux la vidéo : `fr`, `it`, `ar`, `en` (ou `fr,en`) |
-| 2) Voix off | homme / femme |
+| 2) Voix off | **auto** (conseillé) : voix d'homme pour un homme, de femme pour une femme, détecté d'après la hauteur de la voix. Interview homme + femme : la voix suit chaque phrase. Ou imposer homme / femme. (Arabe : voix d'homme uniquement) |
 | 3) Sous-titres | **bandeau karaoké en haut** : bandeau noir en haut avec filet tricolore, mot prononcé surligné en or, la vidéo est légèrement réduite dessous (rien n'est caché, côtés en flou) · **aucun** : pas de texte incrusté (le .srt est quand même fourni) |
 | 4) Tag | Vide = dernière release |
 | 5) Nom de la vidéo | Laisser **vide**. Sert seulement à traduire UNE vidéo précise (le champ 0 est alors ignoré) |

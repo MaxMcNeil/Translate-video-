@@ -9,10 +9,10 @@ on:
         required: true
         default: "fr"
       voix:
-        description: "2) Voix off : homme ou femme (en arabe, toujours homme)"
+        description: "2) Voix off : auto = homme pour un homme, femme pour une femme (détecté seul) ; ou imposer homme / femme"
         type: choice
-        options: [homme, femme]
-        default: homme
+        options: [auto, homme, femme]
+        default: auto
       sous_titres:
         description: "3) Sous-titres : bandeau karaoké EN HAUT (la vidéo est un peu réduite dessous, rien n'est caché) ou aucun"
         type: choice
