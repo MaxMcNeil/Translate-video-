@@ -362,13 +362,51 @@ def translate(texts, src, tgt):
 
 
 # ------------------------------------------------------- homme / femme
-F0_SPLIT = 165.0   # Hz : en dessous voix d'homme, au-dessus voix de femme (adultes)
+F0_SPLIT = 165.0   # Hz : repli seulement (voix grave de femme ≈ 150 Hz → la hauteur seule se trompe)
+GENDER_REPO = "JaesungHuh/voice-gender-classifier"   # ECAPA-TDNN entraîné sur VoxCeleb (YouTube), 98,7 %
+
+
+def _pitch_medians(y, sr, segs):
+    import librosa
+    hop = 160
+    f0 = librosa.yin(y, fmin=65, fmax=400, sr=sr, frame_length=1024, hop_length=hop)
+    rms = librosa.feature.rms(y=y, frame_length=1024, hop_length=hop)[0][:f0.size]
+    loud = rms > max(float(np.percentile(rms, 95)) * 0.18, 1e-4)
+    meds = []
+    for s in segs:
+        a, b = int(s["start"] * sr / hop), int(s["end"] * sr / hop)
+        fr = f0[a:b][loud[a:b]]
+        fr = fr[(fr > 70) & (fr < 380)]
+        meds.append(float(np.median(fr)) if fr.size >= 30 else None)
+    return meds
+
+
+def _neural_female_probs(y, sr, segs):
+    """Probabilité « femme » par phrase (None si phrase trop courte)."""
+    import torch
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from gender_model import ECAPA_gender
+    model = hf_load("modèle homme/femme", lambda local: ECAPA_gender.from_pretrained(
+        GENDER_REPO, local_files_only=local)).eval()
+    out = []
+    with torch.inference_mode():
+        for s in segs:
+            a, b = int(s["start"] * sr), int(s["end"] * sr)
+            seg = y[a:b]
+            if seg.size < sr:                       # < 1 s : pas fiable
+                out.append(None)
+                continue
+            seg = seg[:sr * 20]                     # 20 s suffisent
+            logits = model(torch.from_numpy(seg).float().unsqueeze(0))
+            out.append(float(torch.softmax(logits, dim=1)[0, 1]))
+    del model
+    gc.collect()
+    return out
 
 
 def assign_voices(vocals, work, segs, forced):
-    """Choisit la voix off (homme / femme) d'après la hauteur de la voix d'origine.
-    Une seule personne → une seule voix pour toute la vidéo ; plusieurs personnes de sexes
-    différents (interview) → la voix suit chaque phrase."""
+    """Voix off homme / femme d'après la voix d'origine (modèle neuronal, repli : hauteur).
+    Une seule personne → une seule voix ; interview homme + femme → la voix suit chaque phrase."""
     if forced in ("homme", "femme"):
         for s in segs:
             s["voix"] = forced
@@ -377,53 +415,55 @@ def assign_voices(vocals, work, segs, forced):
     for s in segs:
         s["voix"] = "homme"
     try:
-        import librosa
-        src = work / "pitch16.wav"
+        src = work / "gender16.wav"
         run(["ffmpeg", "-y", "-v", "error", "-i", vocals or (work / "audio16.wav"),
-             "-ac", "1", "-ar", "16000", "-af", "highpass=f=60,lowpass=f=1200", src])
+             "-ac", "1", "-ar", "16000", src])
         y, sr = sf.read(src, dtype="float32")
-        hop = 160  # 10 ms
-        f0 = librosa.yin(y, fmin=65, fmax=400, sr=sr, frame_length=1024, hop_length=hop)
-        rms = librosa.feature.rms(y=y, frame_length=1024, hop_length=hop)[0][:f0.size]
-        loud = rms > max(float(np.percentile(rms, 95)) * 0.18, 1e-4)
-        labels, meds = [], []
-        for s in segs:
-            a, b = int(s["start"] * sr / hop), int(s["end"] * sr / hop)
-            fr = f0[a:b][loud[a:b]]
-            fr = fr[(fr > 70) & (fr < 380)]
-            if fr.size < 30:          # phrase trop courte / pas assez de voix nette
-                labels.append(None)
-                meds.append(None)
-                continue
-            m = float(np.median(fr))
-            meds.append(m)
-            labels.append("femme" if m >= F0_SPLIT else "homme")
-        known = [l for l in labels if l]
+        if y.ndim > 1:
+            y = y.mean(axis=1)
+        meds = []
+        try:
+            meds = _pitch_medians(y, sr, segs)
+        except Exception as e:
+            log(f"Hauteur de voix non mesurée ({e})")
+        method, scores = "modèle neuronal", None
+        try:
+            scores = _neural_female_probs(y, sr, segs)
+            if not any(p is not None for p in scores):
+                raise RuntimeError("aucune phrase assez longue")
+        except Exception as e:
+            warn(f"Modèle homme/femme indisponible ({e}) : repli sur la hauteur de voix (moins fiable).")
+            method = "hauteur de voix"
+            scores = [None if m is None else (1.0 if m >= F0_SPLIT else 0.0) for m in meds]
+        dur = [max(s["end"] - s["start"], 0.1) for s in segs]
+        known = [(p, d) for p, d in zip(scores, dur) if p is not None]
         if not known:
             warn("Sexe de la voix non déterminable : voix d'homme par défaut. "
                  "Tu peux l'imposer avec le champ « Voix off ».")
             return {"voix": "homme (par défaut)", "voix_mode": "auto-échec"}
+        share_f = sum(d for p, d in known if p >= 0.5) / sum(d for _, d in known)
+        mean_p = sum(p * d for p, d in known) / sum(d for _, d in known)
         valid = [m for m in meds if m]
-        global_med = float(np.median(valid))
-        share_f = known.count("femme") / len(known)
-        if share_f >= 0.8 or share_f <= 0.2:
+        hz = round(float(np.median(valid))) if valid else None
+        if share_f >= 0.75 or share_f <= 0.25:
             g = "femme" if share_f >= 0.5 else "homme"
             for s in segs:
                 s["voix"] = g
-            info = {"voix": g, "voix_mode": "auto (une personne)"}
-            if abs(global_med - F0_SPLIT) < 12:
-                warn(f"Voix à la limite homme/femme ({global_med:.0f} Hz) : « {g} » retenu. "
+            info = {"voix": g, "voix_mode": f"auto, une personne ({method})"}
+            if 0.35 < mean_p < 0.65:
+                warn(f"Voix difficile à classer (femme à {mean_p:.0%}) : « {g} » retenu. "
                      "Si c'est faux, impose la voix dans le champ « Voix off ».")
         else:
-            # plusieurs personnes : la voix suit chaque phrase ; phrase indécise → voisine
-            last = known[0]
+            labels = [None if p is None else ("femme" if p >= 0.5 else "homme") for p in scores]
+            last = next(l for l in labels if l)
             for s, l in zip(segs, labels):
                 last = l or last
                 s["voix"] = last
-            info = {"voix": "homme + femme (selon la phrase)", "voix_mode": "auto (plusieurs personnes)"}
-        info.update(hauteur_voix_hz=round(global_med), part_phrases_femme=round(share_f, 2))
-        log(f"Voix d'origine : hauteur médiane {global_med:.0f} Hz, {share_f:.0%} des phrases "
-            f"féminines → voix off « {info['voix']} »")
+            info = {"voix": "homme + femme (selon la phrase)",
+                    "voix_mode": f"auto, plusieurs personnes ({method})"}
+        info.update(hauteur_voix_hz=hz, part_parole_femme=round(share_f, 2), proba_femme=round(mean_p, 2))
+        log(f"Voix d'origine : femme à {mean_p:.0%} ({share_f:.0%} du temps de parole), "
+            f"hauteur médiane {hz} Hz, méthode {method} → voix off « {info['voix']} »")
         return info
     except Exception as e:
         warn(f"Détection homme/femme impossible ({e}) : voix d'homme par défaut.")
@@ -926,15 +966,17 @@ def main():
         REPORT["phrases"] = len(segs)
         if not segs:
             fail("aucune parole détectée dans la vidéo (musique seule ou silence ?).")
+        voix_info = assign_voices(vocals, work, segs, a.voice)
+        REPORT.update(voix_info)
         head = (f"# Langue retenue : {src} (mode {REPORT.get('langue_source_mode')}) — proposées par Whisper : "
                 + ", ".join(f"{l} {p:.0%}" for l, p in REPORT.get("langues_candidates", []))
                 + (f" — comparées (score) : {REPORT.get('langues_comparees')}" if len(REPORT.get("langues_comparees", {})) > 1 else "")
                 + "\n")
+        head += (f"# Voix off : {voix_info.get('voix')} — {voix_info.get('voix_mode')} — femme à "
+                 f"{voix_info.get('proba_femme', '?')}, hauteur {voix_info.get('hauteur_voix_hz', '?')} Hz\n")
         (outdir / f"{stem}__transcription_{src}.txt").write_text(
             head + "\n".join(f"[{s['start']:.1f}] {s['text']}" for s in segs), encoding="utf-8")
         log(f"{len(segs)} phrases")
-        voix_info = assign_voices(vocals, work, segs, a.voice)
-        REPORT.update(voix_info)
         orig_voice = build_orig_voice(vocals, segs, geo["dur"], work) if vocals and a.orig_vol > 0 else None
         lay = layout(geo, mode)
 
