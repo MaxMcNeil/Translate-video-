@@ -207,7 +207,7 @@ def transcribe(video, work, model_size, src):
          "-ar", "16000", wav])
     a, _ = sf.read(wav, dtype="float32")
     if a.size == 0 or float(np.abs(a).max()) < 1e-4:
-        fail("la piste son est muette : rien à traduire.")
+        fail("aucune voix audible dans la piste son : rien à traduire.")
     model = hf_load(f"Whisper {model_size}", lambda local: WhisperModel(
         model_size, device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 2,
         local_files_only=local))
@@ -248,8 +248,14 @@ def resegment(words, soft=7.0, hard=12.0, gap=0.7):
         cur = []
 
     for i, w in enumerate(words):
-        if cur and (w["start"] - cur[-1]["end"] > gap or w["end"] - cur[0]["start"] > hard):
-            close()
+        if cur:
+            prev = cur[-1]["word"].strip()
+            ponct = (SENT_END.search(prev) or SOFT_END.search(prev)) and not ABBREV.match(prev)
+            pause = w["start"] - cur[-1]["end"]
+            # une pause coupe la phrase seulement après une ponctuation, ou si elle est longue
+            # (évite « all U.S. | military bases »)
+            if (pause > gap and ponct) or pause > 1.6 or w["end"] - cur[0]["start"] > hard:
+                close()
         cur.append(w)
         tok = w["word"].strip()
         dur = cur[-1]["end"] - cur[0]["start"]
@@ -443,6 +449,63 @@ def build_dub(segs, texts, model, video_dur, work):
     return out, timing, st
 
 
+# ------------------------------------------------- séparation voix / musique
+def separate(video, work):
+    """Isole la voix (Demucs htdemucs) : la musique de fond n'est JAMAIS gardée.
+    Retourne (voix.wav, infos). En cas d'échec : (None, infos) → voix d'origine coupée."""
+    full = work / "orig44.wav"
+    run(["ffmpeg", "-y", "-v", "error", "-i", video, "-map", "0:a:0", "-vn", "-ac", "2",
+         "-ar", "44100", full])
+    sep = work / "sep"
+    cmd = [sys.executable, "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
+           "-o", str(sep), "--filename", "{stem}.{ext}", str(full)]
+    err = ""
+    for attempt in range(2):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=2700)
+            err = (r.stderr or "")[-600:]
+            voc, acc = sep / "htdemucs" / "vocals.wav", sep / "htdemucs" / "no_vocals.wav"
+            if r.returncode == 0 and voc.exists() and voc.stat().st_size > 10000:
+                v, _ = sf.read(voc, dtype="float32")
+                m, _ = sf.read(acc, dtype="float32") if acc.exists() else (np.zeros(1), 0)
+                rms = lambda x: float(np.sqrt(np.mean(np.square(x)))) if x.size else 0.0
+                rv, rm = rms(v), rms(m)
+                ratio_db = 20 * math.log10(max(rm, 1e-9) / max(rv, 1e-9))
+                music = rm > 0.01 and ratio_db > -20
+                info = {"separation": "OK", "musique_detectee": bool(music),
+                        "niveau_musique_vs_voix_db": round(ratio_db, 1)}
+                log(f"Séparation OK — musique de fond {'DÉTECTÉE et supprimée' if music else 'absente ou négligeable'} "
+                    f"({ratio_db:+.0f} dB par rapport à la voix)")
+                return voc, info
+        except subprocess.TimeoutExpired:
+            err = "délai dépassé (45 min)"
+        log(f"Séparation : essai {attempt + 1} raté ({err.strip()[-300:]})")
+    warn("Séparation voix/musique impossible : par sécurité, la voix d'origine est COUPÉE "
+         "(aucune musique ne peut passer). La traduction continue normalement.")
+    return None, {"separation": "ECHEC → voix d'origine coupée", "erreur_separation": err.strip()[-300:]}
+
+
+def build_orig_voice(vocals, segs, video_dur, work):
+    """Voix d'origine isolée, filtrée, et gardée UNIQUEMENT pendant que la personne parle.
+    Intro / outro / passages musicaux = silence total."""
+    tmp = work / "voc48.wav"
+    run(["ffmpeg", "-y", "-v", "error", "-i", vocals, "-af",
+         "highpass=f=90,lowpass=f=7500,aresample=48000", "-ac", "1", tmp])
+    v, _ = sf.read(tmp, dtype="float32")
+    n = int(video_dur * SR) + 1
+    v = np.pad(v, (0, max(0, n - v.size)))[:n]
+    mask = np.zeros(n, dtype=np.float32)
+    for s in segs:
+        a, b = int(max(s["start"] - 0.15, 0) * SR), int(min(s["end"] + 0.25, video_dur) * SR)
+        mask[a:b] = 1.0
+    k = int(0.06 * SR)  # fondus de 60 ms : pas de clic
+    if k > 1:
+        mask = np.convolve(mask, np.ones(k, dtype=np.float32) / k, mode="same")
+    out = work / "orig_voice.wav"
+    sf.write(out, (v * mask).astype(np.float32), SR)
+    return out
+
+
 # ------------------------------------------------------------- sous-titres
 def ass_time(t):
     cs = int(round(max(t, 0) * 100))
@@ -472,7 +535,21 @@ def chunk_text(text, max_chars):
     return chunks
 
 
+def word_weights(words):
+    """Durée relative de chaque mot à l'oral : longueur + petite pause après la ponctuation."""
+    out = []
+    for w in words:
+        k = max(len(re.sub(r"\W", "", w)), 1) + 1.5
+        if SENT_END.search(w):
+            k += 4
+        elif SOFT_END.search(w):
+            k += 2.5
+        out.append(k)
+    return out
+
+
 def build_cues(texts, timing, line_chars):
+    """Chaque sous-titre (2 lignes max) + l'horaire de chaque mot pour le karaoké."""
     cues = []
     for text, tm in zip(texts, timing):
         if not text or tm is None:
@@ -484,88 +561,159 @@ def build_cues(texts, timing, line_chars):
         t = s
         for p in parts:
             d = (e - s) * len(p) / total
-            cues.append((t, t + d, p))
+            ws = p.split()
+            wt = word_weights(ws)
+            tw, acc, words = sum(wt), t, []
+            for w, k in zip(ws, wt):
+                dw = d * k / tw
+                words.append((acc, acc + dw, w))
+                acc += dw
+            cues.append({"start": t, "end": t + d, "text": p, "words": words})
             t += d
-    # jamais deux sous-titres superposés
-    for k in range(len(cues) - 1):
-        s, e, p = cues[k]
-        if e > cues[k + 1][0]:
-            cues[k] = (s, max(cues[k + 1][0] - 0.01, s + 0.2), p)
+    for k in range(len(cues) - 1):  # jamais deux sous-titres superposés
+        if cues[k]["end"] > cues[k + 1]["start"]:
+            cues[k]["end"] = max(cues[k + 1]["start"] - 0.01, cues[k]["start"] + 0.2)
     return cues
 
 
-def font_size(geo, mode):
+def layout(geo, mode):
+    """Bandeau en HAUT, dans le cadre : la sortie garde exactement le format de l'entrée.
+    La vidéo est légèrement réduite sous le bandeau (rien n'est caché), côtés en flou artistique."""
     W, H = geo["w"], geo["h"]
-    k = 0.052 if mode == "bande" else 0.045
-    if H > W * 1.2:          # vidéo verticale (TikTok, Shorts) : texte plus grand
-        k += 0.012
-    return max(int(min(W, H) * k), 18)
+    if mode == "non":
+        return {"band": 0, "fs": 0, "stripe": 0}
+    portrait = H > W * 1.1
+    fs = int(W * 0.058) if portrait else int(H * 0.058)
+    fs = max(fs, 20)
+    band = int(fs * 3.35)
+    band += band % 2
+    stripe = max(int(fs * 0.12), 3)
+    return {"band": band, "fs": fs, "stripe": stripe}
 
 
-def line_chars_for(geo, mode):
-    return max(int(geo["w"] * 0.92 / (font_size(geo, mode) * 0.55)), 14)
+def line_chars_for(geo, lay):
+    if not lay["fs"]:
+        return 40
+    return max(int(geo["w"] * 0.90 / (lay["fs"] * 0.60)), 12)
 
 
-def write_subs(cues, lang, geo, mode, work, stem):
+# couleurs ASS : &HBBGGRR
+C_WAIT, C_NOW, C_DONE = "&HB4B4B4&", "&H3DC8FF&", "&HFFFFFF&"   # gris / or / blanc
+C_GLOW = "&H0060B0&"                                               # halo orangé du mot en cours
+
+
+def ass_escape(t):
+    return t.replace("\\", "/").replace("{", "(").replace("}", ")")
+
+
+def write_subs(cues, lang, geo, lay, work, stem):
     W, H = geo["w"], geo["h"]
-    fs = font_size(geo, mode)
-    if mode == "bande":
-        band = int(fs * 3.4)
-        band += band % 2
-    else:
-        band = 0
-    total_h = H + band
+    fs, band = lay["fs"] or 20, lay["band"]
     font = "Noto Sans Arabic" if lang == "ar" else "Noto Sans"
-    border = 1 if mode == "bande" else 3
     hdr = (
         "[Script Info]\nScriptType: v4.00+\n"
-        f"PlayResX: {W}\nPlayResY: {total_h}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n"
+        f"PlayResX: {W}\nPlayResY: {H}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n"
         "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, "
         "Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,{font},{fs},&H00FFFFFF,&H000000FF,&H00000000,&H90000000,0,0,0,0,"
-        f"100,100,0,0,{border},{max(fs // 18, 2)},0,2,{int(W * 0.04)},{int(W * 0.04)},"
-        f"{int(H * 0.03)},1\n\n"
+        f"Style: K,{font},{fs},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,"
+        f"100,100,{max(fs // 40, 0)},0,1,{max(fs / 14, 1.5):.1f},{max(fs / 22, 1):.1f},5,"
+        f"{int(W * 0.05)},{int(W * 0.05)},0,1\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
-    pos_tag = f"{{\\an5\\pos({W // 2},{H + band // 2})}}" if mode == "bande" else ""
+    cy = (band - lay["stripe"]) // 2
     lines = []
-    for s, e, txt in cues:
-        safe = txt.replace("\\", "/").replace("{", "(").replace("}", ")")
-        lines.append(f"Dialogue: 0,{ass_time(s)},{ass_time(e)},Default,,0,0,0,,{pos_tag}{safe}")
+    for c in cues:
+        s0 = c["start"]
+        parts = []
+        for ws, we, w in c["words"]:
+            t1, t2 = int((ws - s0) * 1000), int((we - s0) * 1000)
+            parts.append(
+                f"{{\\1c{C_WAIT}\\3c&H000000&"
+                f"\\t({t1},{t1 + 70},\\1c{C_NOW}\\3c{C_GLOW})"
+                f"\\t({t2},{t2 + 140},\\1c{C_DONE}\\3c&H000000&)}}{ass_escape(w)}")
+        body = " ".join(parts)
+        lines.append(f"Dialogue: 0,{ass_time(s0)},{ass_time(c['end'])},K,,0,0,0,,"
+                     f"{{\\an5\\pos({W // 2},{cy})\\fad(120,90)\\blur0.6}}{body}")
     ass = work / f"subs_{lang}.ass"
     ass.write_text(hdr + "\n".join(lines) + "\n", encoding="utf-8")
     srt = work / f"{stem}__{lang.upper()}.srt"
-    srt.write_text("".join(f"{i}\n{srt_time(s)} --> {srt_time(e)}\n{t}\n\n"
-                           for i, (s, e, t) in enumerate(cues, 1)), encoding="utf-8")
-    return ass, srt, band
+    srt.write_text("".join(f"{i}\n{srt_time(c['start'])} --> {srt_time(c['end'])}\n{c['text']}\n\n"
+                           for i, c in enumerate(cues, 1)), encoding="utf-8")
+    return ass, srt
+
+
+def check_fonts(lang):
+    want = "Noto Sans Arabic" if lang == "ar" else "Noto Sans"
+    try:
+        got = run(["fc-match", f"{want}:bold", "family"]).strip()
+    except Exception:
+        got = "?"
+    if want.lower() not in got.lower():
+        warn(f"Police « {want} » absente (remplacée par « {got} ») : rendu des sous-titres dégradé.")
 
 
 # ------------------------------------------------------------------ rendu
-def render(video, dub, ass, band, geo, orig_vol, mode, out):
+def video_filter(geo, lay, ass_name):
     W, H = geo["w"], geo["h"]
-    a_dub = "[1:a]loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000"
-    if geo["audio"] and orig_vol > 0:
-        audio = (f"[0:a:0]aresample=48000,volume={orig_vol}[o];{a_dub}[d];"
-                 "[o][d]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,"
-                 "alimiter=limit=0.95,apad[a]")
+    band = lay["band"]
+    if not band:
+        return f"[0:v:0]scale={W}:{H}:flags=lanczos,setsar=1,format=yuv420p[v]"
+    vh = H - band
+    st = lay["stripe"]
+    third = W // 3
+    return (
+        f"[0:v:0]setsar=1,split=2[a][b];"
+        # fond : la vidéo elle-même agrandie, floutée et assombrie (remplit les côtés)
+        f"[a]scale={W}:{vh}:force_original_aspect_ratio=increase:flags=bilinear,crop={W}:{vh},"
+        f"boxblur=luma_radius=24:luma_power=2,eq=brightness=-0.18:saturation=0.8[bg];"
+        # premier plan : la vidéo entière, réduite pour tenir sous le bandeau (rien n'est coupé)
+        f"[b]scale={W}:{vh}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos[fg];"
+        f"[bg]setsar=1[bg1];[fg]setsar=1[fg1];[bg1][fg1]overlay=(W-w)/2:(H-h)/2[vid];"
+        f"[vid]pad={W}:{H}:0:{band}:color=0x0A0A0E,"
+        # filet tricolore sous le bandeau
+        f"drawbox=x=0:y={band - st}:w={third}:h={st}:color=0x1F4FB8:t=fill,"
+        f"drawbox=x={third}:y={band - st}:w={W - 2 * third}:h={st}:color=0xF2F2F2:t=fill,"
+        f"drawbox=x={W - third}:y={band - st}:w={third}:h={st}:color=0xD7263D:t=fill,"
+        f"subtitles={ass_name},setsar=1,format=yuv420p[v]"
+    )
+
+
+def render(video, dub, orig_voice, ass, geo, lay, orig_vol, out):
+    inputs = ["-i", Path(video).resolve(), "-i", Path(dub).resolve()]
+    a = "[1:a]loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000[d]"
+    if orig_voice is not None and orig_vol > 0:
+        inputs += ["-i", Path(orig_voice).resolve()]
+        a += (f";[2:a]aresample=48000,volume={orig_vol:.3f}[o];"
+              "[d][o]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+              "alimiter=limit=0.95,apad[a]")
     else:
-        audio = f"{a_dub},apad[a]"
-    vf = f"[0:v:0]scale={W}:{H}:flags=lanczos,setsar=1"
-    if band:
-        vf += f",pad={W}:{H + band}:0:0:black"
-    if mode != "non":
-        vf += f",subtitles={ass.name}"
-    vf += ",format=yuv420p[v]"
-    cmd = ["ffmpeg", "-y", "-v", "error", "-i", Path(video).resolve(), "-i", Path(dub).resolve(),
-           "-filter_complex", f"{vf};{audio}", "-map", "[v]", "-map", "[a]",
+        a += ";[d]apad[a]"
+    # Le son d'origine de la vidéo (piste 0:a) n'est JAMAIS utilisé : aucune musique possible.
+    cmd = ["ffmpeg", "-y", "-v", "error", *inputs,
+           "-filter_complex", f"{video_filter(geo, lay, ass.name)};{a}",
+           "-map", "[v]", "-map", "[a]",
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
            "-c:a", "aac", "-b:a", "192k", "-t", f"{geo['dur']:.3f}",
            "-movflags", "+faststart", Path(out).resolve()]
     run(cmd, cwd=ass.parent)
     chk = probe(out)
-    if abs(chk["dur"] - geo["dur"]) > 1.5 or not chk["audio"]:
-        fail(f"vidéo finale incohérente (durée {chk['dur']:.1f} s au lieu de {geo['dur']:.1f} s).")
+    problems = []
+    if abs(chk["dur"] - geo["dur"]) > 1.5:
+        problems.append(f"durée {chk['dur']:.1f} s au lieu de {geo['dur']:.1f} s")
+    if (chk["w"], chk["h"]) != (geo["w"], geo["h"]):
+        problems.append(f"format {chk['w']}x{chk['h']} au lieu de {geo['w']}x{geo['h']}")
+    if not chk["audio"]:
+        problems.append("pas de son")
+    else:
+        vd = subprocess.run(["ffmpeg", "-v", "info", "-i", str(out), "-map", "0:a:0",
+                             "-af", "volumedetect", "-f", "null", "-"],
+                            capture_output=True, text=True).stderr
+        mv = re.search(r"max_volume:\s*(-?[\d.]+)", vd)
+        if mv and float(mv.group(1)) < -45:
+            problems.append("son quasi muet")
+    if problems:
+        fail("vidéo finale incohérente : " + ", ".join(problems) + ".")
 
 
 # ----------------------------------------------------------------- rapport
@@ -582,6 +730,8 @@ def write_report(outdir, stem):
     L += ["| Élément | Valeur |", "|---|---|",
           f"| Durée vidéo | {r.get('duree_s', '?')} s ({r.get('dimensions', '?')}) |",
           f"| Langue parlée | {r.get('langue_source', '?')} (certitude {r.get('langue_source_proba', '?')}) |",
+          f"| Musique de fond | {'détectée → supprimée' if r.get('musique_detectee') else 'absente'} "
+          f"(séparation : {r.get('separation', '?')}) |",
           f"| Mots transcrits | {r.get('mots', '?')} — phrases : {r.get('phrases', '?')} |"]
     for lang, s in r.get("sorties", {}).items():
         L.append(f"| Sortie {lang.upper()} | {s.get('fichier')} — {s.get('phrases')} phrases doublées, "
@@ -602,7 +752,7 @@ def main():
     ap.add_argument("--langs", default="fr")
     ap.add_argument("--src", default="auto")
     ap.add_argument("--voice", default="homme", choices=["homme", "femme"])
-    ap.add_argument("--subs", default="bande", choices=["bande", "bas", "non"])
+    ap.add_argument("--subs", default="bandeau", choices=["bandeau", "bande", "bas", "non"])
     ap.add_argument("--orig-vol", type=float, default=0.05)
     ap.add_argument("--whisper", default="medium")
     ap.add_argument("--outdir", default="out")
@@ -615,6 +765,7 @@ def main():
     if video.suffix.lower() != ".mp4":  # a.mp4 et a.mov ne s'écrasent pas
         stem += "_" + video.suffix.lower().lstrip(".")
     REPORT.update(video=video.name, sorties={}, parametres=vars(a))
+    mode = "non" if a.subs == "non" else "bandeau"
 
     try:
         stage("1. Vérifications et analyse de la vidéo")
@@ -643,8 +794,12 @@ def main():
         work = Path("work").resolve() / stem
         work.mkdir(parents=True, exist_ok=True)
 
-        stage("2. Transcription (Whisper)")
-        words, src = transcribe(video, work, a.whisper, src)
+        stage("2. Séparation voix / musique (Demucs)")
+        vocals, sep_info = separate(video, work)
+        REPORT.update(sep_info)
+
+        stage("3. Transcription (Whisper)")
+        words, src = transcribe(vocals or video, work, a.whisper, src)
         if src not in NLLB:
             fail(f"langue détectée « {src} » non traduisible. Force la langue dans le champ « Langue PARLÉE ».")
         segs = resegment(words)
@@ -654,24 +809,27 @@ def main():
         (outdir / f"{stem}__transcription_{src}.txt").write_text(
             "\n".join(f"[{s['start']:.1f}] {s['text']}" for s in segs), encoding="utf-8")
         log(f"{len(segs)} phrases")
+        orig_voice = build_orig_voice(vocals, segs, geo["dur"], work) if vocals and a.orig_vol > 0 else None
+        lay = layout(geo, mode)
 
         for lang in langs:
-            stage(f"3. Traduction {src} → {lang}")
+            stage(f"4. Traduction {src} → {lang}")
             texts = [clean_for_tts(t) for t in translate([s["text"] for s in segs], src, lang)]
             if not any(texts):
                 fail("la traduction n'a rien produit.")
-            stage(f"4. Voix off {lang.upper()} ({a.voice})")
+            stage(f"5. Voix off {lang.upper()} ({a.voice})")
             model = voice_model(lang, a.voice)
             if lang == "ar" and a.voice == "femme":
                 warn("Pas de voix féminine arabe disponible : voix masculine utilisée.")
             dub, timing, st = build_dub(segs, texts, model, geo["dur"], work)
-            stage(f"5. Sous-titres {lang.upper()} ({a.subs})")
-            cues = build_cues(texts, timing, line_chars_for(geo, a.subs))
-            ass, srt, band = write_subs(cues, lang, geo, a.subs, work, stem)
+            stage(f"6. Sous-titres karaoké {lang.upper()} ({mode})")
+            check_fonts(lang)
+            cues = build_cues(texts, timing, line_chars_for(geo, lay))
+            ass, srt = write_subs(cues, lang, geo, lay, work, stem)
             srt.replace(outdir / srt.name)
-            stage(f"6. Montage final {lang.upper()}")
+            stage(f"7. Montage final {lang.upper()}")
             out = outdir / f"{stem}__{lang.upper()}.mp4"
-            render(video, dub, ass, band, geo, a.orig_vol, a.subs, out)
+            render(video, dub, orig_voice, ass, geo, lay, a.orig_vol, out)
             size = out.stat().st_size / 1e6
             if size > 1900:
                 warn(f"Fichier de {size:.0f} Mo : proche de la limite de 2 Go des releases.")

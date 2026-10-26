@@ -14,13 +14,12 @@ on:
         options: [homme, femme]
         default: homme
       sous_titres:
-        description: "3) Sous-titres : où les afficher"
+        description: "3) Sous-titres : bandeau karaoké EN HAUT (la vidéo est un peu réduite dessous, rien n'est caché) ou aucun"
         type: choice
         options:
-          - "sous l'image (bande noire, visages jamais cachés)"
-          - "sur l'image (en bas, peut cacher le menton)"
+          - "bandeau karaoké en haut"
           - "aucun"
-        default: "sous l'image (bande noire, visages jamais cachés)"
+        default: "bandeau karaoké en haut"
       nombre_videos:
         description: "0) Combien de vidéos de la release traduire EN MÊME TEMPS : 1, 2, 3… ou toutes"
         required: true
@@ -38,7 +37,7 @@ on:
         required: false
         default: "auto"
       volume_original:
-        description: "7) Volume de la voix d'origine : 0 = muette, 0.05 = à peine audible, 0.2 = audible"
+        description: "7) Voix d'origine (musique toujours supprimée) : 0 = coupée, 0.05 = à peine audible, 0.2 = audible"
         required: false
         default: "0.05"
       modele_whisper:
@@ -181,20 +180,21 @@ jobs:
         with:
           path: |
             ~/.cache/huggingface
+            ~/.cache/torch/hub
             models
-          key: models-v2-${{ inputs.modele_whisper }}
-          restore-keys: models-v2-
+          key: models-v3-${{ inputs.modele_whisper }}
+          restore-keys: models-v3-
 
       - name: Dépendances Python
         timeout-minutes: 25
         run: |
           for i in 1 2 3; do
-            pip install --retries 5 --timeout 60 --index-url https://download.pytorch.org/whl/cpu torch==2.4.1 \
+            pip install --retries 5 --timeout 60 --index-url https://download.pytorch.org/whl/cpu torch==2.4.1 torchaudio==2.4.1 \
               && pip install --retries 5 --timeout 60 -r requirements.txt && break
             echo "pip : essai $i raté, nouvel essai"; sleep $((20 * i))
             [ "$i" = 3 ] && { echo "::error::Installation des dépendances Python impossible."; exit 1; }
           done
-          python -c "import faster_whisper, transformers, torch, soundfile; print('dépendances OK')"
+          python -c "import faster_whisper, transformers, torch, torchaudio, soundfile, demucs.separate; print('dépendances OK', torch.__version__, torchaudio.__version__)"
 
       - name: Moteur de voix Piper
         timeout-minutes: 10
@@ -235,10 +235,11 @@ jobs:
           IN_WHISPER: ${{ inputs.modele_whisper }}
         run: |
           case "$IN_SUBS" in
-            sous*) SUBS=bande ;;
-            sur*)  SUBS=bas ;;
-            *)     SUBS=non ;;
+            aucun*) SUBS=non ;;
+            *)      SUBS=bandeau ;;
           esac
+          python -c "import demucs.pretrained as p; p.get_model('htdemucs'); print('modèle Demucs OK')" \
+            || echo "::warning::Modèle Demucs non préchargé (nouvel essai pendant la traduction)."
           python scripts/translate_video.py --input "$IN_VIDEO" --langs "$IN_LANGS" \
             --voice "$IN_VOICE" --subs "$SUBS" --src "$IN_SRC" \
             --orig-vol "${IN_VOL//,/.}" --whisper "$IN_WHISPER" --outdir out

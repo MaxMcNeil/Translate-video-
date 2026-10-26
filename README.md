@@ -13,19 +13,19 @@ Traduit une vidéo (arabe, italien, allemand, chinois, japonais… 40 langues) e
 | 0) Nombre de vidéos | Combien de vidéos de la release traduire en même temps : `1`, `3`… ou `toutes`. Chaque vidéo tourne sur sa propre machine, en parallèle ; si une échoue, les autres continuent |
 | 1) Langue de SORTIE | La langue dans laquelle tu veux la vidéo : `fr`, `it`, `ar`, `en` (ou `fr,en`) |
 | 2) Voix off | homme / femme |
-| 3) Sous-titres | **sous l'image** : bande noire ajoutée en bas, l'image n'est jamais recouverte · **sur l'image** : texte posé en bas de la vidéo, sans bande · **aucun** : pas de sous-titres incrustés (le fichier .srt est quand même fourni) |
+| 3) Sous-titres | **bandeau karaoké en haut** : bandeau noir en haut avec filet tricolore, mot prononcé surligné en or, la vidéo est légèrement réduite dessous (rien n'est caché, côtés en flou) · **aucun** : pas de texte incrusté (le .srt est quand même fourni) |
 | 4) Tag | Vide = dernière release |
 | 5) Nom de la vidéo | Laisser **vide**. Sert seulement à traduire UNE vidéo précise (le champ 0 est alors ignoré) |
 | 6) Langue PARLÉE | Laisser `auto` (détection automatique). À forcer (`ar`, `de`, `zh`…) seulement si la détection se trompe |
-| 7) Volume d'origine | 0.05 = à peine audible |
+| 7) Voix d'origine | 0.05 = à peine audible, 0 = coupée. La musique de fond est **toujours** supprimée |
 | 8) Qualité | `medium` conseillé |
 
 ## Ce que fait le workflow
 - **Transcription** : faster-whisper (local, horodatage au mot près).
 - **Traduction** : NLLB-200 de Meta (local, hors ligne).
 - **Voix off** : Piper (local). Chaque phrase démarre quand la personne commence à parler et son débit est ajusté pour finir avec elle.
-- **Voix originale** à 5 % (réglable).
-- **Sous-titres** dans une bande noire ajoutée sous l'image → ils ne cachent jamais les visages.
+- **Musique supprimée** : la voix est isolée par Demucs ; seule la voix d'origine (sans musique) est gardée, et uniquement pendant que la personne parle. Le son d'origine de la vidéo n'est jamais réutilisé tel quel. Si la séparation échoue, la voix d'origine est coupée (aucune musique ne peut passer).
+- **Sous-titres karaoké** dans un bandeau en haut ; la vidéo de sortie garde exactement le format de l'entrée (horizontale ou verticale).
 
 Lancement manuel uniquement, aucune exécution automatique.
 
