@@ -4,8 +4,20 @@ Traduit une vidéo (arabe, italien, allemand, chinois, japonais… 40 langues) e
 
 ## Utilisation
 1. **Releases → Draft a new release** : crée un tag (ex. `v1`), dépose ta vidéo (mp4, mov, mkv, webm), publie.
-2. **Actions → Traduire une vidéo → Run workflow** : choisis la langue (`fr`, `it`, `ar`, `en` ou plusieurs : `fr,en`).
+2. **Actions → Traduire une vidéo → Run workflow** : choisis la langue de sortie (`fr`, `it`, `ar`, `en` ou plusieurs : `fr,en`). La langue parlée dans la vidéo est détectée automatiquement.
 3. 15–30 min plus tard, la vidéo traduite `…__FR.mp4` et ses sous-titres `.srt` apparaissent dans la même release.
+
+## Les champs du formulaire
+| Champ | Ce qu'il faut mettre |
+|---|---|
+| 1) Langue de SORTIE | La langue dans laquelle tu veux la vidéo : `fr`, `it`, `ar`, `en` (ou `fr,en`) |
+| 2) Voix off | homme / femme |
+| 3) Sous-titres | **sous l'image** : bande noire ajoutée en bas, l'image n'est jamais recouverte · **sur l'image** : texte posé en bas de la vidéo, sans bande · **aucun** : pas de sous-titres incrustés (le fichier .srt est quand même fourni) |
+| 4) Tag | Vide = dernière release |
+| 5) Nom de la vidéo | Vide = première vidéo de la release |
+| 6) Langue PARLÉE | Laisser `auto` (détection automatique). À forcer (`ar`, `de`, `zh`…) seulement si la détection se trompe |
+| 7) Volume d'origine | 0.05 = à peine audible |
+| 8) Qualité | `medium` conseillé |
 
 ## Ce que fait le workflow
 - **Transcription** : faster-whisper (local, horodatage au mot près).

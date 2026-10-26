@@ -5,37 +5,40 @@ on:
   workflow_dispatch:
     inputs:
       langues:
-        description: "Langue(s) de sortie : fr, it, ar, en (ex. fr ou fr,en)"
+        description: "1) Langue de SORTIE voulue : fr, it, ar ou en. Plusieurs = fr,en"
         required: true
         default: "fr"
       voix:
-        description: "Voix off"
+        description: "2) Voix off : homme ou femme (en arabe, toujours homme)"
         type: choice
         options: [homme, femme]
         default: homme
       sous_titres:
-        description: "bande = sous l'image (ne cache jamais les visages) / bas = sur l'image / non"
+        description: "3) Sous-titres : où les afficher"
         type: choice
-        options: [bande, bas, non]
-        default: bande
+        options:
+          - "sous l'image (bande noire, visages jamais cachés)"
+          - "sur l'image (en bas, peut cacher le menton)"
+          - "aucun"
+        default: "sous l'image (bande noire, visages jamais cachés)"
       tag:
-        description: "Tag de la release (vide = la plus récente)"
+        description: "4) Tag de la release où est la vidéo. Vide = la release la plus récente"
         required: false
         default: ""
       fichier:
-        description: "Nom exact de la vidéo dans la release (vide = la première vidéo)"
+        description: "5) Nom de la vidéo dans la release. Vide = la 1re vidéo trouvée"
         required: false
         default: ""
       langue_source:
-        description: "Langue d'origine (auto, ou ar, it, de, zh, ja…)"
+        description: "6) Langue PARLÉE dans la vidéo. auto = détection automatique (laisser auto)"
         required: false
         default: "auto"
       volume_original:
-        description: "Volume de la voix originale (0.05 = à peine audible)"
+        description: "7) Volume de la voix d'origine : 0 = muette, 0.05 = à peine audible, 0.2 = audible"
         required: false
         default: "0.05"
       modele_whisper:
-        description: "Précision de la transcription"
+        description: "8) Qualité de compréhension : medium = conseillé, small = rapide, large-v3 = meilleur mais lent"
         type: choice
         options: [medium, small, large-v3]
         default: medium
@@ -131,8 +134,13 @@ jobs:
           IN_VOL: ${{ inputs.volume_original }}
           IN_WHISPER: ${{ inputs.modele_whisper }}
         run: |
+          case "$IN_SUBS" in
+            sous*) SUBS=bande ;;
+            sur*)  SUBS=bas ;;
+            *)     SUBS=non ;;
+          esac
           python scripts/translate_video.py --input "$IN_VIDEO" --langs "$IN_LANGS" \
-            --voice "$IN_VOICE" --subs "$IN_SUBS" --src "$IN_SRC" \
+            --voice "$IN_VOICE" --subs "$SUBS" --src "$IN_SRC" \
             --orig-vol "$IN_VOL" --whisper "$IN_WHISPER" --outdir out
           ls -la out
 
