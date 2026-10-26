@@ -238,34 +238,44 @@ def transcribe(video, work, model_size, src):
 
     if src != "auto":
         best = one_pass(src)
-        prob, cands = 1.0, [(src, 1.0)]
+        prob, cands, tried = 1.0, [(src, 1.0)], {}
     else:
-        # 1) Whisper propose ses langues ; on corrige les confusions classiques
-        #    (accent britannique → gallois, etc.) en favorisant les langues courantes.
         first = one_pass(None)
         probs = dict(first["info"].all_language_probs or [(first["lang"], 1.0)])
-        cands = sorted(probs.items(), key=lambda kv: kv[1] * (1.0 if kv[0] in COMMON_LANGS else 0.15),
-                       reverse=True)[:3]
-        log("Langues candidates : " + ", ".join(f"{l} {p:.0%}" for l, p in cands))
-        best = first if cands[0][0] == first["lang"] else one_pass(cands[0][0])
-        # 2) transcription douteuse (boucles, faible confiance) → on essaie la candidate suivante
-        if (best["rep"] > 0.12 or best["score"] < -1.0) and len(cands) > 1:
-            alt_lang = next(l for l, _ in cands if l != best["lang"])
-            alt = one_pass(alt_lang)
-            log(f"Transcription douteuse en « {best['lang']} » (score {best['score']:.2f}) → essai en "
-                f"« {alt_lang} » (score {alt['score']:.2f})")
-            if alt["score"] > best["score"]:
-                best = alt
+        probs.setdefault(first["lang"], float(first["info"].language_probability or 0))
+        ranked = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)
+        cands = ranked[:3]
+        log("Langues proposées par Whisper : " + ", ".join(f"{l} {p:.0%}" for l, p in cands))
+        tried = {first["lang"]: first}
+        top, top_p = ranked[0]
+        sure = top in COMMON_LANGS and top_p >= 0.7 and first["rep"] < 0.12 and first["score"] > -0.8
+        if not sure:
+            # Doute (langue rare, faible certitude ou transcription bancale) : on transcrit aussi
+            # dans les meilleures langues courantes et on garde celle qui « comprend » le mieux.
+            extra = [l for l, _ in ranked if l in COMMON_LANGS][:2]
+            if top not in COMMON_LANGS and "en" not in extra:
+                extra.append("en")
+            for l in extra:
+                if l not in tried:
+                    tried[l] = one_pass(l)
+        for r in tried.values():   # petit avantage aux langues courantes
+            r["final"] = r["score"] + (0.1 if r["lang"] in COMMON_LANGS else 0.0)
+        best = max(tried.values(), key=lambda r: r["final"])
+        if len(tried) > 1:
+            log("Comparaison : " + ", ".join(f"{l} score {r['final']:.2f}" for l, r in tried.items())
+                + f" → « {best['lang']} »")
         prob = probs.get(best["lang"], 0.0)
         if best["lang"] != first["lang"]:
-            warn(f"Langue corrigée : Whisper proposait « {first['lang']} », retenu « {best['lang']} ».")
+            warn(f"Langue corrigée : Whisper proposait « {first['lang']} », retenu « {best['lang']} » "
+                 "(transcription nettement meilleure).")
     words, lang, dropped = best["words"], best["lang"], best["dropped"]
     REPORT.update(langue_source=lang, langue_source_proba=round(prob, 2), langue_source_mode=src,
                   langues_candidates=[[l, round(p, 2)] for l, p in cands],
+                  langues_comparees={l: round(r.get("final", r["score"]), 2) for l, r in tried.items()},
                   mots=len(words), segments_ecartes=dropped, score_transcription=round(best["score"], 2))
     log(f"Langue source : {lang} (certitude {prob:.0%}{', forcée' if src != 'auto' else ''}), "
         f"{len(words)} mots, {dropped} passage(s) douteux écarté(s), score {best['score']:.2f}")
-    if src == "auto" and prob < 0.5:
+    if src == "auto" and prob < 0.5 and len(tried) == 1:
         warn(f"Détection de langue peu sûre ({lang}, {prob:.0%}). Si le résultat est faux, "
              "relance en remplissant le champ « Langue PARLÉE ».")
     if best["score"] < -1.2:
@@ -916,8 +926,12 @@ def main():
         REPORT["phrases"] = len(segs)
         if not segs:
             fail("aucune parole détectée dans la vidéo (musique seule ou silence ?).")
+        head = (f"# Langue retenue : {src} (mode {REPORT.get('langue_source_mode')}) — proposées par Whisper : "
+                + ", ".join(f"{l} {p:.0%}" for l, p in REPORT.get("langues_candidates", []))
+                + (f" — comparées (score) : {REPORT.get('langues_comparees')}" if len(REPORT.get("langues_comparees", {})) > 1 else "")
+                + "\n")
         (outdir / f"{stem}__transcription_{src}.txt").write_text(
-            "\n".join(f"[{s['start']:.1f}] {s['text']}" for s in segs), encoding="utf-8")
+            head + "\n".join(f"[{s['start']:.1f}] {s['text']}" for s in segs), encoding="utf-8")
         log(f"{len(segs)} phrases")
         voix_info = assign_voices(vocals, work, segs, a.voice)
         REPORT.update(voix_info)
