@@ -298,7 +298,8 @@ def resegment(words, soft=7.0, hard=12.0, gap=0.7):
     for i, w in enumerate(words):
         if cur:
             prev = cur[-1]["word"].strip()
-            ponct = (SENT_END.search(prev) or SOFT_END.search(prev)) and not ABBREV.match(prev)
+            cont = w["word"].strip()[:1].isalpha() and w["word"].strip()[:1].islower()
+            ponct = (SOFT_END.search(prev) or (SENT_END.search(prev) and not cont)) and not ABBREV.match(prev)
             pause = w["start"] - cur[-1]["end"]
             # une pause coupe la phrase seulement après une ponctuation, ou si elle est longue
             # (évite « all U.S. | military bases »)
@@ -308,7 +309,10 @@ def resegment(words, soft=7.0, hard=12.0, gap=0.7):
         tok = w["word"].strip()
         dur = cur[-1]["end"] - cur[0]["start"]
         nxt_gap = (words[i + 1]["start"] - w["end"]) if i + 1 < len(words) else 9
-        if SENT_END.search(tok) and not ABBREV.match(tok) and dur > 1.0:
+        nxt_tok = words[i + 1]["word"].strip() if i + 1 < len(words) else ""
+        nxt_lower = bool(nxt_tok) and nxt_tok[0].isalpha() and nxt_tok[0].islower()
+        # « all U.S. military » : la suite en minuscule prouve que la phrase continue
+        if SENT_END.search(tok) and not ABBREV.match(tok) and not nxt_lower and dur > 1.0:
             close()
         elif dur > soft and (SOFT_END.search(tok) or nxt_gap > 0.2):
             close()
