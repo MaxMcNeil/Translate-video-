@@ -27,7 +27,7 @@ import soundfile as sf
 SR = 48000
 MAX_DUR = 45 * 60      # durée max traitée d'un seul tenant (s) ; au-delà : découpage en parties
 MAX_TOTAL = 3 * 3600   # durée max d'une vidéo découpée (s) — au-delà, le fichier final dépasserait 2 Go
-CHUNK_TARGET = int(os.environ.get("TV_CHUNK_SECONDS", "900"))   # durée visée d'une partie (s)
+CHUNK_TARGET = int(os.environ.get("TV_CHUNK_SECONDS", "600"))   # durée visée d'une partie (s)
 # Vidéo d'entrée et, en mode « partie », la portion à traiter (lue directement dans la vidéo d'origine)
 MAIN = {"path": None, "ss": None, "t": None, "chunk": False}
 ROOT = Path(__file__).resolve().parent.parent

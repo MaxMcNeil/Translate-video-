@@ -160,7 +160,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       # au-delà de cette durée, la vidéo est découpée en parties traitées en parallèle
-      DECOUPE_AU_DELA_S: "1500"
+      DECOUPE_AU_DELA_S: "1200"
     steps:
       - uses: actions/checkout@v6
 
