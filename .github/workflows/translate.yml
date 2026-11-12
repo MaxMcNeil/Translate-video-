@@ -53,6 +53,7 @@ permissions:
 # Pas de file d'attente globale : deux lancements ne s'annulent jamais l'un l'autre.
 
 env:
+  TV_CHUNK_SECONDS: "200"   # TEST UNIQUEMENT
   HF_HUB_DISABLE_TELEMETRY: "1"
   HF_HUB_DOWNLOAD_TIMEOUT: "60"
   HF_HUB_ETAG_TIMEOUT: "20"
@@ -160,7 +161,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       # au-delà de cette durée, la vidéo est découpée en parties traitées en parallèle
-      DECOUPE_AU_DELA_S: "1500"
+      DECOUPE_AU_DELA_S: "300"
     steps:
       - uses: actions/checkout@v6
 
