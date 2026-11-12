@@ -1,0 +1,51 @@
+name: Installer les outils de traduction
+description: ffmpeg, polices, Python, modèles en cache, dépendances, Piper — avec réessais
+inputs:
+  modele_whisper:
+    description: Modèle Whisper (sert à la clé de cache)
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v6
+      with:
+        python-version: "3.11"
+        cache: pip
+
+    - name: Paquets système (ffmpeg, polices dont l'arabe)
+      shell: bash
+      run: bash scripts/apt_install.sh
+
+    - name: Cache des modèles
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cache/huggingface
+          ~/.cache/torch/hub
+          models
+        key: models-v3-${{ inputs.modele_whisper }}
+        restore-keys: models-v3-
+
+    - name: Dépendances Python
+      shell: bash
+      run: |
+        for i in 1 2 3; do
+          timeout 20m pip install --retries 5 --timeout 60 --index-url https://download.pytorch.org/whl/cpu torch==2.4.1 torchaudio==2.4.1 \
+            && timeout 20m pip install --retries 5 --timeout 60 -r requirements.txt && break
+          echo "pip : essai $i raté, nouvel essai"; sleep $((20 * i))
+          [ "$i" = 3 ] && { echo "::error::Installation des dépendances Python impossible."; exit 1; }
+        done
+        python -c "import faster_whisper, transformers, torch, torchaudio, soundfile, demucs.separate, librosa; print('dépendances OK', torch.__version__, torchaudio.__version__)"
+
+    - name: Moteur de voix Piper
+      shell: bash
+      run: |
+        if [ ! -x models/piper/piper/piper ]; then
+          rm -rf models/piper; mkdir -p models/piper
+          curl -fL --retry 6 --retry-delay 10 --retry-all-errors --max-time 600 -o /tmp/piper.tgz \
+            https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz
+          tar -xzf /tmp/piper.tgz -C models/piper
+        fi
+        test -x models/piper/piper/piper || { echo "::error::Piper introuvable après installation."; exit 1; }
+        python -c "import demucs.pretrained as p; p.get_model('htdemucs'); print('modèle Demucs OK')" \
+          || echo "::warning::Modèle Demucs non préchargé (nouvel essai pendant la traduction)."

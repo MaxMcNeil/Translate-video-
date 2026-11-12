@@ -25,7 +25,11 @@ import numpy as np
 import soundfile as sf
 
 SR = 48000
-MAX_DUR = 45 * 60   # durée maximale acceptée (s)
+MAX_DUR = 45 * 60      # durée max traitée d'un seul tenant (s) ; au-delà : découpage en parties
+MAX_TOTAL = 3 * 3600   # durée max d'une vidéo découpée (s) — au-delà, le fichier final dépasserait 2 Go
+CHUNK_TARGET = int(os.environ.get("TV_CHUNK_SECONDS", "900"))   # durée visée d'une partie (s)
+# Vidéo d'entrée et, en mode « partie », la portion à traiter (lue directement dans la vidéo d'origine)
+MAIN = {"path": None, "ss": None, "t": None, "chunk": False}
 ROOT = Path(__file__).resolve().parent.parent
 MODELS = ROOT / "models"
 PIPER_BIN = MODELS / "piper" / "piper" / "piper"
@@ -105,8 +109,20 @@ def stage(nom):
         log(f"▶ {nom}")
 
 
+class Fatal(Exception):
+    """Erreur définitive (fichier invalide, saisie fausse…) : inutile de réessayer."""
+
+
 def fail(msg):
-    raise SystemExit(f"::error::[{_STAGE['nom']}] {msg}")
+    raise Fatal(f"[{_STAGE['nom']}] {msg}")
+
+
+def vin(path):
+    """Arguments d'entrée ffmpeg ; pour la vidéo d'origine en mode partie : seulement la portion voulue."""
+    p = Path(path).resolve()
+    if MAIN["path"] is not None and p == MAIN["path"] and MAIN["ss"] is not None:
+        return ["-ss", f"{MAIN['ss']:.3f}", "-t", f"{MAIN['t']:.3f}", "-i", p]
+    return ["-i", p]
 
 
 def run(cmd, **kw):
@@ -208,10 +224,14 @@ def probe(path):
 def transcribe(video, work, model_size, src):
     from faster_whisper import WhisperModel
     wav = work / "audio16.wav"
-    run(["ffmpeg", "-y", "-v", "error", "-i", video, "-map", "0:a:0", "-vn", "-ac", "1",
+    run(["ffmpeg", "-y", "-v", "error", *vin(video), "-map", "0:a:0", "-vn", "-ac", "1",
          "-ar", "16000", wav])
     a, _ = sf.read(wav, dtype="float32")
     if a.size == 0 or float(np.abs(a).max()) < 1e-4:
+        if MAIN["chunk"]:   # une partie peut être un passage sans parole : ce n'est pas une erreur
+            log("Partie sans son audible.")
+            REPORT.update(langue_source=src, mots=0)
+            return [], src
         fail("aucune voix audible dans la piste son : rien à traduire.")
     model = hf_load(f"Whisper {model_size}", lambda local: WhisperModel(
         model_size, device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 2,
@@ -429,6 +449,7 @@ def _neural_female_probs(y, sr, segs):
 def assign_voices(vocals, work, segs, forced):
     """Voix off homme / femme d'après la voix d'origine (modèle neuronal, repli : hauteur).
     Une seule personne → une seule voix ; interview homme + femme → la voix suit chaque phrase."""
+    per_phrase = forced == "par-phrase"   # vidéo découpée avec plusieurs personnes
     if forced in ("homme", "femme"):
         for s in segs:
             s["voix"] = forced
@@ -467,7 +488,7 @@ def assign_voices(vocals, work, segs, forced):
         mean_p = sum(p * d for p, d in known) / sum(d for _, d in known)
         valid = [m for m in meds if m]
         hz = round(float(np.median(valid))) if valid else None
-        if share_f >= 0.75 or share_f <= 0.25:
+        if (share_f >= 0.75 or share_f <= 0.25) and not per_phrase:
             g = "femme" if share_f >= 0.5 else "homme"
             for s in segs:
                 s["voix"] = g
@@ -635,7 +656,7 @@ def separate(video, work, dur=300.0):
     """Isole la voix (Demucs htdemucs) : la musique de fond n'est JAMAIS gardée.
     Retourne (voix.wav, infos). En cas d'échec : (None, infos) → voix d'origine coupée."""
     full = work / "orig44.wav"
-    run(["ffmpeg", "-y", "-v", "error", "-i", video, "-map", "0:a:0", "-vn", "-ac", "2",
+    run(["ffmpeg", "-y", "-v", "error", *vin(video), "-map", "0:a:0", "-vn", "-ac", "2",
          "-ar", "44100", full])
     sep = work / "sep"
     cmd = [sys.executable, "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
@@ -839,13 +860,15 @@ def check_fonts(lang):
 def video_filter(geo, lay, ass_name):
     W, H = geo["w"], geo["h"]
     band = lay["band"]
+    # en mode partie : cadence fixe identique pour toutes les parties → recollage sans défaut
+    fps = f"fps={geo['force_fps']}," if geo.get("force_fps") else ""
     if not band:
-        return f"[0:v:0]scale={W}:{H}:flags=lanczos,setsar=1,format=yuv420p[v]"
+        return f"[0:v:0]{fps}scale={W}:{H}:flags=lanczos,setsar=1,format=yuv420p[v]"
     vh = H - band
     st = lay["stripe"]
     third = W // 3
     return (
-        f"[0:v:0]setsar=1,split=2[a][b];"
+        f"[0:v:0]{fps}setsar=1,split=2[a][b];"
         # fond : la vidéo elle-même agrandie, floutée et assombrie (remplit les côtés)
         f"[a]scale={W}:{vh}:force_original_aspect_ratio=increase:flags=bilinear,crop={W}:{vh},"
         f"boxblur=luma_radius=24:luma_power=2,eq=brightness=-0.18:saturation=0.8[bg];"
@@ -866,12 +889,12 @@ def max_kbps(geo):
     est très longue pour que le fichier reste sous 1,8 Go."""
     px = geo["w"] * geo["h"]
     k = int(6000 * px / (1920 * 1080)) + 800
-    budget = int(1.8e9 * 8 / 1000 / max(geo["dur"], 1)) - 200   # kb/s disponibles (son 192k compris)
+    budget = int(1.8e9 * 8 / 1000 / max(geo.get("budget_dur") or geo["dur"], 1)) - 200   # kb/s disponibles (son 192k compris)
     return max(min(k, budget, 8000), 600)
 
 
-def render(video, dub, orig_voice, ass, geo, lay, orig_vol, out):
-    inputs = ["-i", Path(video).resolve(), "-i", Path(dub).resolve()]
+def render(video, dub, orig_voice, ass, geo, lay, orig_vol, out, silent_ok=False):
+    inputs = [*vin(video), "-i", Path(dub).resolve()]
     a = "[1:a]loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000[d]"
     if orig_voice is not None and orig_vol > 0:
         inputs += ["-i", Path(orig_voice).resolve()]
@@ -903,7 +926,7 @@ def render(video, dub, orig_voice, ass, geo, lay, orig_vol, out):
                              "-af", "volumedetect", "-f", "null", "-"],
                             capture_output=True, text=True).stderr
         mv = re.search(r"max_volume:\s*(-?[\d.]+)", vd)
-        if mv and float(mv.group(1)) < -45:
+        if mv and float(mv.group(1)) < -45 and not silent_ok:
             problems.append("son quasi muet")
     if problems:
         fail("vidéo finale incohérente : " + ", ".join(problems) + ".")
@@ -939,17 +962,168 @@ def write_report(outdir, stem):
         f.write("\n".join(L) + "\n\n")
 
 
+# ---------------------------------------------------- plan de découpage
+def speech_spans(wav16, total):
+    """Passages de parole [(début, fin)] en s. Silero (VAD de Whisper), repli : énergie du son."""
+    y, sr = sf.read(wav16, dtype="float32")
+    try:
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+        ts = get_speech_timestamps(y, VadOptions(min_silence_duration_ms=250, speech_pad_ms=60))
+        spans = [(t["start"] / sr, t["end"] / sr) for t in ts]
+        log(f"Détection de parole (Silero) : {len(spans)} passages")
+        return spans, y, sr
+    except Exception as e:
+        log(f"VAD Silero indisponible ({e}) → détection par énergie")
+    hop = int(0.05 * sr)
+    n = y.size // hop
+    rms = np.sqrt(np.mean(y[:n * hop].reshape(n, hop) ** 2, axis=1)) if n else np.zeros(0)
+    thr = max(float(np.percentile(rms, 30)) * 1.8, 1e-4) if n else 1
+    spans, cur = [], None
+    for i, v in enumerate(rms):
+        if v > thr and cur is None:
+            cur = i * 0.05
+        elif v <= thr and cur is not None:
+            spans.append((cur, i * 0.05))
+            cur = None
+    if cur is not None:
+        spans.append((cur, total))
+    return spans, y, sr
+
+
+def cut_points(spans, y, sr, total, n):
+    """n-1 points de coupe, chacun au milieu de la plus grande pause proche de la cible.
+    Jamais au milieu d'une phrase sauf s'il n'existe aucune pause (on coupe alors au son le plus faible)."""
+    gaps = []
+    prev = 0.0
+    for a, b in spans:
+        if a > prev:
+            gaps.append((prev, a))
+        prev = max(prev, b)
+    if total > prev:
+        gaps.append((prev, total))
+    cuts, last = [], 0.0
+    for k in range(1, n):
+        target = total * k / n
+        lo, hi = max(last + 60, target - 150), min(total - 60, target + 150)
+        best, best_score = None, -1e9
+        for g0, g1 in gaps:
+            m = (g0 + g1) / 2
+            if lo <= m <= hi and g1 - g0 >= 0.3:
+                score = (g1 - g0) - 0.004 * abs(m - target)
+                if score > best_score:
+                    best, best_score = m, score
+        how = "pause"
+        if best is None:   # pas de pause : point le plus calme (fenêtres de 100 ms)
+            how = "son le plus faible"
+            hop = int(0.1 * sr)
+            i0, i1 = int(max(lo, target - 60) * sr), int(min(hi, target + 60) * sr)
+            seg = y[i0:i1]
+            m = seg.size // hop
+            if m > 0:
+                e = np.sqrt(np.mean(seg[:m * hop].reshape(m, hop) ** 2, axis=1))
+                best = (i0 + (int(np.argmin(e)) + 0.5) * hop) / sr
+            else:
+                best = target
+        best = round(float(best), 3)
+        log(f"Coupe {k}/{n - 1} à {best / 60:.2f} min ({how})")
+        cuts.append(best)
+        last = best
+    return cuts
+
+
+def make_plan(video, a, plan_path):
+    """Vidéo longue : points de coupe + décisions communes (langue, voix) prises UNE fois,
+    pour que toutes les parties soient traduites de façon identique."""
+    stage("1. Analyse de la vidéo longue")
+    geo = probe(video)
+    total = geo["dur"]
+    log(f"Vidéo {geo['w']}x{geo['h']}, {total / 60:.1f} min")
+    if not geo["audio"]:
+        fail("la vidéo n'a pas de son : rien à traduire.")
+    if total > MAX_TOTAL:
+        fail(f"vidéo de {total / 3600:.1f} h : limite de {MAX_TOTAL // 3600} h (au-delà, la vidéo traduite "
+             "dépasserait 2 Go, limite d'un fichier de release). Coupe-la en deux.")
+    n = max(1, math.ceil(total / CHUNK_TARGET))
+    work = Path("work").resolve() / "plan"
+    work.mkdir(parents=True, exist_ok=True)
+
+    stage("2. Points de coupe (sur des pauses)")
+    wav16 = work / "full16.wav"
+    run(["ffmpeg", "-y", "-v", "error", "-i", video, "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", wav16])
+    spans, y, sr = speech_spans(wav16, total)
+    cuts = cut_points(spans, y, sr, total, n) if n > 1 else []
+    bounds = [0.0] + cuts + [round(total, 3)]
+    parts = [{"k": i + 1, "start": bounds[i], "end": bounds[i + 1]} for i in range(len(bounds) - 1)]
+    del y
+
+    stage("3. Langue et voix communes (extrait de 4 min)")
+    win = 80
+    ex = work / "extrait.wav"
+    starts = [max(0.0, min(total - win, total * f - win / 2)) for f in (0.2, 0.5, 0.8)]
+    pieces = []
+    for i, st in enumerate(starts):
+        pi = work / f"ex{i}.wav"
+        run(["ffmpeg", "-y", "-v", "error", "-ss", f"{st:.3f}", "-t", str(win), "-i", video,
+             "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "44100", pi])
+        pieces.append(pi)
+    lst = work / "ex.txt"
+    lst.write_text("".join(f"file '{p}'\n" for p in pieces))
+    run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", ex])
+    vocals, _ = separate(ex, work, 240)
+    src = a.src.strip().lower() or "auto"
+    words, lang = transcribe(vocals or ex, work, a.whisper, src)
+    segs = resegment(words)
+    if not segs:
+        warn("Pas de parole dans l'extrait : langue et voix seront décidées par chaque partie.")
+        lang_out, voice_out = src, a.voice
+    else:
+        lang_out = lang
+        if lang not in NLLB:
+            fail(f"langue détectée « {lang} » non traduisible. Force la langue dans le champ « Langue PARLÉE ».")
+        if a.voice in ("homme", "femme"):
+            voice_out = a.voice
+        else:
+            info = assign_voices(vocals, work, segs, "auto")
+            REPORT.update(info)
+            if "plusieurs" in info.get("voix_mode", ""):
+                voice_out = "par-phrase"
+            elif info.get("voix") in ("homme", "femme"):
+                voice_out = info["voix"]
+            else:
+                voice_out = "auto"
+    plan = {"video": Path(video).name, "duree": round(total, 3), "parties": parts,
+            "src": lang_out, "voix": voice_out, "langues_candidates": REPORT.get("langues_candidates"),
+            "voix_detail": {k: REPORT.get(k) for k in ("voix", "voix_mode", "proba_femme", "hauteur_voix_hz")}}
+    Path(plan_path).write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    stage("")
+    log(f"Plan : {len(parts)} parties, langue « {lang_out} », voix « {voice_out} »")
+    for p_ in parts:
+        log(f"  partie {p_['k']} : {p_['start'] / 60:.2f} → {p_['end'] / 60:.2f} min")
+    summ = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summ:
+        with open(summ, "a", encoding="utf-8") as f:
+            f.write(f"### ✂️ {Path(video).name} : {total / 60:.0f} min → {len(parts)} parties traitées en parallèle\n\n"
+                    f"- Langue commune : **{lang_out}** — voix commune : **{voice_out}**\n"
+                    + "".join(f"- Partie {p_['k']} : {p_['start'] / 60:.1f} → {p_['end'] / 60:.1f} min\n" for p_ in parts)
+                    + "".join(f"- ⚠️ {w}\n" for w in REPORT["avertissements"]) + "\n")
+
+
 # ------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--langs", default="fr")
     ap.add_argument("--src", default="auto")
-    ap.add_argument("--voice", default="auto", choices=["auto", "homme", "femme"])
+    ap.add_argument("--voice", default="auto", choices=["auto", "homme", "femme", "par-phrase"])
     ap.add_argument("--subs", default="bandeau", choices=["bandeau", "bande", "bas", "non"])
     ap.add_argument("--orig-vol", type=float, default=0.05)
     ap.add_argument("--whisper", default="medium")
     ap.add_argument("--outdir", default="out")
+    ap.add_argument("--plan", help="écrit le plan de découpage (vidéo longue) dans ce fichier et s'arrête")
+    ap.add_argument("--start", type=float, help="mode partie : début (s) dans la vidéo d'origine")
+    ap.add_argument("--end", type=float, help="mode partie : fin (s)")
+    ap.add_argument("--part", default="", help="mode partie : libellé, ex. 2/5")
+    ap.add_argument("--total-dur", type=float, default=0, help="mode partie : durée totale de la vidéo")
     a = ap.parse_args()
 
     video = Path(a.input).resolve()
@@ -958,10 +1132,17 @@ def main():
     stem = re.sub(r"[^\w\-]+", "_", video.stem, flags=re.ASCII).strip("_")[:80] or "video"
     if video.suffix.lower() != ".mp4":  # a.mp4 et a.mov ne s'écrasent pas
         stem += "_" + video.suffix.lower().lstrip(".")
-    REPORT.update(video=video.name, sorties={}, parametres=vars(a))
+    REPORT.update(video=video.name + (f" (partie {a.part})" if a.part else ""), sorties={},
+                  parametres=vars(a))
     mode = "non" if a.subs == "non" else "bandeau"
+    MAIN["path"] = video
 
     try:
+        if a.plan:
+            if not video.exists() or video.stat().st_size == 0:
+                fail("vidéo absente ou vide.")
+            make_plan(video, a, a.plan)
+            return
         stage("1. Vérifications et analyse de la vidéo")
         langs = list(dict.fromkeys(l.strip().lower() for l in re.split(r"[,; ]+", a.langs) if l.strip()))
         bad = [l for l in langs if l not in VOICES]
@@ -977,13 +1158,29 @@ def main():
         if not video.exists() or video.stat().st_size == 0:
             fail("vidéo absente ou vide.")
         geo = probe(video)
+        if a.start is not None:      # ---- mode partie
+            end = min(a.end if a.end is not None else geo["dur"], geo["dur"])
+            if not 0 <= a.start < end:
+                fail(f"partie invalide ({a.start} → {end} s).")
+            MAIN.update(ss=a.start, t=end - a.start, chunk=True)
+            geo["dur"] = end - a.start
+            geo["budget_dur"] = a.total_dur or geo["dur"]
+            fr = geo.get("fps") or ""
+            try:
+                num, den = (int(x) for x in fr.split("/"))
+                ok = den > 0 and 5 <= num / den <= 120
+            except Exception:
+                ok = False
+            geo["force_fps"] = fr if ok else "30"
+            REPORT.update(partie=a.part, debut_s=a.start, fin_s=round(end, 3))
+            log(f"Partie {a.part} : {a.start / 60:.2f} → {end / 60:.2f} min (cadence {geo['force_fps']})")
         REPORT.update(duree_s=round(geo["dur"], 1), dimensions=f"{geo['w']}x{geo['h']}")
         log(f"Vidéo {geo['w']}x{geo['h']}, {geo['dur']:.1f} s, codec {geo['vcodec']}, son={geo['audio']}")
         if not geo["audio"]:
             fail("la vidéo n'a pas de son : rien à traduire.")
         if geo["dur"] > MAX_DUR:
-            fail(f"vidéo de {geo['dur'] / 60:.0f} min : limite de {MAX_DUR // 60} min (au-delà, le traitement "
-                 "dépasserait les 6 h maximum d'un job GitHub). Coupe-la en plusieurs parties.")
+            fail(f"vidéo de {geo['dur'] / 60:.0f} min traitée d'un seul tenant : limite de {MAX_DUR // 60} min. "
+                 "(Le workflow découpe normalement les vidéos longues automatiquement.)")
         if geo["dur"] > 900:
             log(f"Vidéo longue ({geo['dur'] / 60:.0f} min) : compter environ {geo['dur'] / 60 * 4:.0f} min de traitement.")
         work = Path("work").resolve() / stem
@@ -995,37 +1192,47 @@ def main():
 
         stage("3. Transcription (Whisper)")
         words, src = transcribe(vocals or video, work, a.whisper, src)
-        if src not in NLLB:
-            fail(f"langue détectée « {src} » non traduisible. Force la langue dans le champ « Langue PARLÉE ».")
         segs = resegment(words)
         REPORT["phrases"] = len(segs)
-        if not segs:
+        if segs and src not in NLLB:
+            fail(f"langue détectée « {src} » non traduisible. Force la langue dans le champ « Langue PARLÉE ».")
+        if not segs and not MAIN["chunk"]:
             fail("aucune parole détectée dans la vidéo (musique seule ou silence ?).")
-        voix_info = assign_voices(vocals, work, segs, a.voice)
+        if segs:
+            voix_info = assign_voices(vocals, work, segs, a.voice)
+        else:
+            voix_info = {"voix": "aucune (passage sans parole)", "voix_mode": "-"}
+            log("Passage sans parole : image gardée, son coupé (musique supprimée), pas de sous-titre.")
         REPORT.update(voix_info)
-        head = (f"# Langue retenue : {src} (mode {REPORT.get('langue_source_mode')}) — proposées par Whisper : "
-                + ", ".join(f"{l} {p:.0%}" for l, p in REPORT.get("langues_candidates", []))
-                + (f" — comparées (score) : {REPORT.get('langues_comparees')}" if len(REPORT.get("langues_comparees", {})) > 1 else "")
+        head = (f"# Langue retenue : {src} (mode {REPORT.get('langue_source_mode', src)}) — proposées par Whisper : "
+                + ", ".join(f"{l} {p:.0%}" for l, p in (REPORT.get("langues_candidates") or []))
+                + (f" — comparées (score) : {REPORT.get('langues_comparees')}" if len(REPORT.get("langues_comparees") or {}) > 1 else "")
                 + "\n")
         head += (f"# Voix off : {voix_info.get('voix')} — {voix_info.get('voix_mode')} — femme à "
                  f"{voix_info.get('proba_femme', '?')}, hauteur {voix_info.get('hauteur_voix_hz', '?')} Hz\n")
         (outdir / f"{stem}__transcription_{src}.txt").write_text(
             head + "\n".join(f"[{s['start']:.1f}] {s['text']}" for s in segs), encoding="utf-8")
         log(f"{len(segs)} phrases")
-        orig_voice = build_orig_voice(vocals, segs, geo["dur"], work) if vocals and a.orig_vol > 0 else None
+        orig_voice = build_orig_voice(vocals, segs, geo["dur"], work) if vocals and a.orig_vol > 0 and segs else None
         lay = layout(geo, mode)
 
         for lang in langs:
-            stage(f"4. Traduction {src} → {lang}")
-            texts = [clean_for_tts(t) for t in translate([s["text"] for s in segs], src, lang)]
-            if not any(texts):
-                fail("la traduction n'a rien produit.")
-            stage(f"5. Voix off {lang.upper()} ({voix_info['voix']})")
-            needed = sorted({s["voix"] for s in segs})
-            models = {g: voice_model(lang, g) for g in needed}
-            if lang == "ar" and "femme" in needed:
-                warn("Pas de voix féminine arabe disponible : voix masculine utilisée pour l'arabe.")
-            dub, timing, st = build_dub(segs, texts, models, geo["dur"], work)
+            if segs:
+                stage(f"4. Traduction {src} → {lang}")
+                texts = [clean_for_tts(t) for t in translate([s["text"] for s in segs], src, lang)]
+                if not any(texts):
+                    fail("la traduction n'a rien produit.")
+                stage(f"5. Voix off {lang.upper()} ({voix_info['voix']})")
+                needed = sorted({s["voix"] for s in segs})
+                models = {g: voice_model(lang, g) for g in needed}
+                if lang == "ar" and "femme" in needed:
+                    warn("Pas de voix féminine arabe disponible : voix masculine utilisée pour l'arabe.")
+                dub, timing, st = build_dub(segs, texts, models, geo["dur"], work)
+            else:
+                texts, timing = [], []
+                dub = work / "dub.wav"
+                sf.write(dub, np.zeros(int(geo["dur"] * SR) + 1, dtype=np.float32), SR)
+                st = {"phrases": 0, "voix_ratees": 0, "accelerees": 0, "ecart_moyen_s": 0}
             stage(f"6. Sous-titres karaoké {lang.upper()} ({mode})")
             check_fonts(lang)
             cues = build_cues(texts, timing, line_chars_for(geo, lay))
@@ -1033,7 +1240,7 @@ def main():
             srt.replace(outdir / srt.name)
             stage(f"7. Montage final {lang.upper()}")
             out = outdir / f"{stem}__{lang.upper()}.mp4"
-            render(video, dub, orig_voice, ass, geo, lay, a.orig_vol, out)
+            render(video, dub, orig_voice, ass, geo, lay, a.orig_vol, out, silent_ok=not segs)
             size = out.stat().st_size / 1e6
             if size > 1900:
                 warn(f"Fichier de {size:.0f} Mo : proche de la limite de 2 Go des releases.")
@@ -1042,19 +1249,20 @@ def main():
             log(f"OK → {out.name} ({size:.1f} Mo)")
         stage("")
         REPORT["statut"] = "OK"
-    except SystemExit as e:
+    except Fatal as e:
         REPORT.update(statut="ECHEC", etape_en_echec=_STAGE["nom"],
-                      erreur=re.sub(r"^::error::\[[^\]]*\]\s*", "", str(e.code)))
+                      erreur=re.sub(r"^\[[^\]]*\]\s*", "", str(e)))
         stage("")
         write_report(outdir, stem)
-        raise
+        print(f"::error::{e}", flush=True)
+        sys.exit(2)          # 2 = erreur définitive : le workflow ne réessaie pas
     except Exception as e:
         traceback.print_exc()
         REPORT.update(statut="ECHEC", etape_en_echec=_STAGE["nom"], erreur=f"{type(e).__name__}: {e}")
         stage("")
         write_report(outdir, stem)
         print(f"::error::[{REPORT['etape_en_echec']}] {type(e).__name__}: {e}", flush=True)
-        sys.exit(1)
+        sys.exit(1)          # 1 = erreur imprévue : le workflow réessaie une fois
     write_report(outdir, stem)
 
 

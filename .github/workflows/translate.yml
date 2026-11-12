@@ -147,11 +147,11 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "videos=$(cat sel.json)" >> "$GITHUB_OUTPUT"
 
-  traduire:
+  preparer:
     needs: lister
-    name: "Traduire : ${{ matrix.name }}"
+    name: "Préparer : ${{ matrix.name }}"
     runs-on: ubuntu-24.04
-    timeout-minutes: 355
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       max-parallel: 20
@@ -159,85 +159,137 @@ jobs:
         include: ${{ fromJSON(needs.lister.outputs.videos) }}
     env:
       GH_TOKEN: ${{ github.token }}
-      TAG: ${{ needs.lister.outputs.tag }}
-      NAME: ${{ matrix.name }}
-      ASSET_ID: ${{ matrix.id }}
-      ASSET_SIZE: ${{ matrix.size }}
+      # au-delà de cette durée, la vidéo est découpée en parties traitées en parallèle
+      DECOUPE_AU_DELA_S: "1500"
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Paquets système (ffmpeg, polices dont l'arabe)
+      - name: ffmpeg
         timeout-minutes: 15
-        run: |
-          for i in 1 2 3 4; do
-            sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends ffmpeg fonts-noto-core && break
-            echo "apt : essai $i raté, nouvel essai"; sleep $((15 * i))
-          done
-          ffmpeg -version | head -1
-          fc-list | grep -q "Noto Sans Arabic" || echo "::warning::Police arabe absente"
-          df -h / | tail -1
-
-      - name: Cache des modèles
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cache/huggingface
-            ~/.cache/torch/hub
-            models
-          key: models-v3-${{ inputs.modele_whisper }}
-          restore-keys: models-v3-
-
-      - name: Dépendances Python
-        timeout-minutes: 25
-        run: |
-          for i in 1 2 3; do
-            pip install --retries 5 --timeout 60 --index-url https://download.pytorch.org/whl/cpu torch==2.4.1 torchaudio==2.4.1 \
-              && pip install --retries 5 --timeout 60 -r requirements.txt && break
-            echo "pip : essai $i raté, nouvel essai"; sleep $((20 * i))
-            [ "$i" = 3 ] && { echo "::error::Installation des dépendances Python impossible."; exit 1; }
-          done
-          python -c "import faster_whisper, transformers, torch, torchaudio, soundfile, demucs.separate; print('dépendances OK', torch.__version__, torchaudio.__version__)"
-
-      - name: Moteur de voix Piper
-        timeout-minutes: 10
-        run: |
-          if [ ! -x models/piper/piper/piper ]; then
-            rm -rf models/piper; mkdir -p models/piper
-            curl -fL --retry 6 --retry-delay 10 --retry-all-errors -o /tmp/piper.tgz \
-              https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz
-            tar -xzf /tmp/piper.tgz -C models/piper
-          fi
-          test -x models/piper/piper/piper || { echo "::error::Piper introuvable après installation."; exit 1; }
+        run: bash scripts/apt_install.sh
 
       - name: Télécharger la vidéo
-        id: get
-        timeout-minutes: 20
+        timeout-minutes: 30
+        run: bash scripts/download_asset.sh "${{ matrix.id }}" "${{ matrix.size }}" "${{ matrix.name }}"
+
+      - name: Durée de la vidéo
+        id: d
+        env:
+          NAME: ${{ matrix.name }}
         run: |
-          set -uo pipefail
-          mkdir -p in
-          F="in/$NAME"
-          for i in 1 2 3 4; do
-            gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID" > "$F" \
-              && [ "$(stat -c %s "$F")" = "$ASSET_SIZE" ] && break
-            echo "Téléchargement : essai $i raté ou incomplet, nouvel essai"; sleep $((10 * i))
-            [ "$i" = 4 ] && { echo "::error::Impossible de télécharger « $NAME » complètement depuis la release $TAG."; exit 1; }
-          done
-          echo "Release : $TAG — vidéo : $NAME ($(du -h "$F" | cut -f1))"
-          echo "file=$F" >> "$GITHUB_OUTPUT"
+          D=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "in/$NAME" 2>/dev/null | head -1)
+          case "$D" in ''|N/A) D=0 ;; esac
+          echo "Durée : $D s"
+          if python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) > float(sys.argv[2]) else 1)" "$D" "$DECOUPE_AU_DELA_S"; then
+            echo "mode=parties" >> "$GITHUB_OUTPUT"
+            echo "Vidéo longue : découpage en parties"
+          else
+            echo "mode=direct" >> "$GITHUB_OUTPUT"
+          fi
+          echo "duree=$D" >> "$GITHUB_OUTPUT"
+
+      - name: Installer les outils (vidéo longue)
+        if: steps.d.outputs.mode == 'parties'
+        uses: ./.github/actions/installer
+        with:
+          modele_whisper: ${{ inputs.modele_whisper }}
+
+      - name: Plan (points de coupe, langue et voix communes)
+        timeout-minutes: 60
+        env:
+          NAME: ${{ matrix.name }}
+          ID: ${{ matrix.id }}
+          SIZE: ${{ matrix.size }}
+          MODE: ${{ steps.d.outputs.mode }}
+          DUR: ${{ steps.d.outputs.duree }}
+          IN_SRC: ${{ inputs.langue_source }}
+          IN_VOICE: ${{ inputs.voix }}
+          IN_WHISPER: ${{ inputs.modele_whisper }}
+        run: |
+          mkdir -p plan
+          if [ "$MODE" = "direct" ]; then
+            jq -n --arg id "$ID" --arg n "$NAME" --arg s "$SIZE" --arg d "$DUR" \
+              '{id:($id|tonumber), name:$n, size:($s|tonumber), mode:"direct", duree:($d|tonumber)}' > "plan/plan-$ID.json"
+          else
+            python scripts/translate_video.py --input "in/$NAME" --plan raw.json \
+              --src "$IN_SRC" --voice "$IN_VOICE" --whisper "$IN_WHISPER" --outdir plan_out
+            jq --arg id "$ID" --arg n "$NAME" --arg s "$SIZE" \
+              '. + {id:($id|tonumber), name:$n, size:($s|tonumber), mode:"parties"}' raw.json > "plan/plan-$ID.json"
+          fi
+          cat "plan/plan-$ID.json"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: plan-${{ matrix.id }}
+          path: plan/
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
+
+  planifier:
+    needs: [lister, preparer]
+    if: always() && needs.lister.result == 'success'
+    name: "Répartir le travail"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      taches: ${{ steps.t.outputs.taches }}
+      longues: ${{ steps.t.outputs.longues }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: plan-*
+          path: plans
+        continue-on-error: true
+      - name: Liste des tâches
+        id: t
+        env:
+          VIDEOS: ${{ needs.lister.outputs.videos }}
+          IN_SRC: ${{ inputs.langue_source }}
+          IN_VOICE: ${{ inputs.voix }}
+        run: |
+          mkdir -p plans
+          python3 scripts/build_tasks.py plans "$IN_SRC" "$IN_VOICE" "$VIDEOS"
+
+  traduire:
+    needs: [lister, planifier]
+    if: always() && needs.planifier.result == 'success'
+    name: "Traduire : ${{ matrix.name }}${{ matrix.n > 1 && format(' — partie {0}/{1}', matrix.k, matrix.n) || '' }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        include: ${{ fromJSON(needs.planifier.outputs.taches) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.lister.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/installer
+        with:
+          modele_whisper: ${{ inputs.modele_whisper }}
+
+      - name: Télécharger la vidéo
+        timeout-minutes: 30
+        run: bash scripts/download_asset.sh "${{ matrix.id }}" "${{ matrix.size }}" "${{ matrix.name }}"
 
       - name: Traduire (transcription → traduction → voix off → montage)
         timeout-minutes: 330
         env:
-          IN_VIDEO: ${{ steps.get.outputs.file }}
+          NAME: ${{ matrix.name }}
+          K: ${{ matrix.k }}
+          N: ${{ matrix.n }}
+          START: ${{ matrix.start }}
+          END: ${{ matrix['end'] }}
+          TOTAL: ${{ matrix.total }}
+          T_SRC: ${{ matrix.src }}
+          T_VOICE: ${{ matrix.voix }}
           IN_LANGS: ${{ inputs.langues }}
-          IN_VOICE: ${{ inputs.voix }}
           IN_SUBS: ${{ inputs.sous_titres }}
-          IN_SRC: ${{ inputs.langue_source }}
           IN_VOL: ${{ inputs.volume_original }}
           IN_WHISPER: ${{ inputs.modele_whisper }}
         run: |
@@ -245,54 +297,110 @@ jobs:
             aucun*) SUBS=non ;;
             *)      SUBS=bandeau ;;
           esac
-          python -c "import demucs.pretrained as p; p.get_model('htdemucs'); print('modèle Demucs OK')" \
-            || echo "::warning::Modèle Demucs non préchargé (nouvel essai pendant la traduction)."
-          python scripts/translate_video.py --input "$IN_VIDEO" --langs "$IN_LANGS" \
-            --voice "$IN_VOICE" --subs "$SUBS" --src "$IN_SRC" \
-            --orig-vol "${IN_VOL//,/.}" --whisper "$IN_WHISPER" --outdir out
-          ls -la out
+          ARGS=(--input "in/$NAME" --langs "$IN_LANGS" --voice "$T_VOICE" --subs "$SUBS" --src "$T_SRC"
+                --orig-vol "${IN_VOL//,/.}" --whisper "$IN_WHISPER" --outdir out)
+          if [ "$N" -gt 1 ]; then
+            ARGS+=(--start "$START" --end "$END" --part "$K/$N" --total-dur "$TOTAL")
+          fi
+          for essai in 1 2; do
+            rm -rf out work
+            python scripts/translate_video.py "${ARGS[@]}" && { ls -la out; exit 0; }
+            code=$?
+            # 2 = erreur définitive (fichier invalide…) : réessayer ne servirait à rien
+            if [ "$code" = 2 ] || [ "$essai" = 2 ]; then exit "$code"; fi
+            echo "::warning::Erreur imprévue (code $code) : nouvel essai complet dans 30 s."
+            sleep 30
+          done
 
       - name: Publier dans la même release
+        if: matrix.n == 1
         timeout-minutes: 20
+        run: bash scripts/publish.sh "$TAG" out
+
+      - name: Copie de secours + rapport (artefact 7 jours)
+        if: always() && matrix.n == 1
+        uses: actions/upload-artifact@v6
+        with:
+          name: resultat-${{ matrix.id }}
+          path: out/
+          retention-days: 7
+          if-no-files-found: ignore
+          overwrite: true
+
+      - name: Transmettre la partie au recollage
+        if: matrix.n > 1
+        uses: actions/upload-artifact@v6
+        with:
+          name: part-${{ matrix.id }}-${{ matrix.k }}
+          path: out/
+          retention-days: 3
+          if-no-files-found: error
+          overwrite: true
+          compression-level: 0
+
+  recoller:
+    needs: [lister, planifier, traduire]
+    if: always() && needs.planifier.result == 'success' && needs.planifier.outputs.longues != '[]'
+    name: "Recoller : ${{ matrix.name }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.planifier.outputs.longues) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.lister.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: ffmpeg
+        timeout-minutes: 15
+        run: bash scripts/apt_install.sh
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: plan-${{ matrix.id }}
+          path: plan
+
+      - name: Récupérer les parties
+        uses: actions/download-artifact@v7
+        with:
+          pattern: part-${{ matrix.id }}-*
+          path: dl
+        continue-on-error: true
+
+      - name: Recoller (vidéo, sous-titres, transcription)
+        timeout-minutes: 60
+        env:
+          ID: ${{ matrix.id }}
         run: |
-          shopt -s nullglob
-          FILES=(out/*.mp4 out/*.srt out/*.txt)
-          [ ${#FILES[@]} -gt 0 ] || { echo "::error::Aucun fichier à publier."; exit 1; }
-          for i in 1 2 3 4; do
-            if gh release upload "$TAG" "${FILES[@]}" -R "$GITHUB_REPOSITORY" --clobber; then
-              printf 'Publié : %s\n' "${FILES[@]}"
-              # anciens résultats de CETTE vidéo devenus obsolètes (ex. transcription d'une autre langue) → supprimés
-              T=$(ls out/*__transcription_*.txt 2>/dev/null | head -1 || true)
-              if [ -n "$T" ]; then
-                STEM=$(basename "$T"); STEM="${STEM%%__transcription_*}"
-                NEW=$(printf '%s\n' "${FILES[@]}" | xargs -n1 basename)
-                gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-                  | jq -r --arg t "$TAG" --arg p "${STEM}__" '.[] | select(.tag_name==$t) | .assets[] | select(.name | startswith($p)) | "\(.id) \(.name)"' \
-                  | while read -r id name; do
-                      if ! grep -qxF "$name" <<< "$NEW"; then
-                        gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$id" && echo "Ancien fichier supprimé : $name" || true
-                      fi
-                    done
-              fi
-              exit 0
-            fi
-            echo "Envoi : essai $i raté, nouvel essai"; sleep $((15 * i))
+          mkdir -p parts dl
+          for d in dl/part-"$ID"-*; do
+            [ -d "$d" ] || continue
+            k="${d##*-}"
+            mv "$d" "parts/part-$k"
           done
-          echo "::error::Envoi dans la release impossible. La vidéo traduite est dans les artefacts de ce run (7 jours)."
-          exit 1
+          ls -R parts | head -50
+          python3 scripts/assemble.py --plan "plan/plan-$ID.json" --parts parts --outdir out
+
+      - name: Publier dans la même release
+        timeout-minutes: 30
+        run: bash scripts/publish.sh "$TAG" out
 
       - name: Copie de secours + rapport (artefact 7 jours)
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: resultat-${{ strategy.job-index }}
+          name: resultat-${{ matrix.id }}
           path: out/
           retention-days: 7
           if-no-files-found: ignore
+          overwrite: true
 
   bilan:
     name: "Bilan"
-    needs: [lister, traduire]
+    needs: [lister, preparer, planifier, traduire, recoller]
     if: always() && needs.lister.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -303,23 +411,26 @@ jobs:
       - name: Bilan du lancement
         run: |
           R="$GITHUB_REPOSITORY"
-          gh api "repos/$R/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
-            -q '.jobs[] | select(.name | startswith("Traduire")) | [.name, (.conclusion // .status)] | @tsv' > jobs.tsv || true
-          OK=$(grep -c $'\tsuccess$' jobs.tsv || true)
-          TOT=$(wc -l < jobs.tsv)
+          gh api "repos/$R/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" --paginate \
+            -q '.jobs[] | select(.name != "Bilan") | [.name, (.conclusion // .status)] | @tsv' > jobs.tsv || true
+          # jobs non lancés car rien à faire (ex. pas de vidéo longue) : ignorés
+          grep -v $'\tskipped$' jobs.tsv > used.tsv || true
+          BAD=$(grep -cvE $'\tsuccess$' used.tsv || true)
           {
-            echo "## Bilan : $OK / $TOT vidéo(s) traduite(s)"
+            echo "## Bilan : $([ "$BAD" = 0 ] && echo '✅ tout est réussi' || echo "❌ $BAD étape(s) en échec")"
             echo ""
-            echo "| Vidéo | Résultat |"
+            echo "| Étape | Résultat |"
             echo "|---|---|"
             while IFS=$'\t' read -r n c; do
-              case "$c" in success) e="✅ réussie";; failure) e="❌ échec (voir le détail du job)";; cancelled) e="⏹ annulée";; *) e="$c";; esac
-              echo "| ${n#Traduire : } | $e |"
-            done < jobs.tsv
+              case "$c" in success) e="✅";; failure) e="❌ échec (voir le détail du job)";; cancelled) e="⏹ annulé";; *) e="$c";; esac
+              echo "| $n | $e |"
+            done < used.tsv
+            echo ""
+            echo "Les vidéos longues ne sont publiées qu'une fois toutes leurs parties réussies et recollées."
             echo ""
             echo "Fichiers maintenant dans la release **$TAG** :"
             gh api "repos/$R/releases?per_page=100" | jq -r --arg t "$TAG" \
               '.[] | select(.tag_name==$t) | .assets[] | "- \(.name) (\(.size/1048576*10|floor/10) Mo)"'
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
-          [ "$OK" = "$TOT" ] || { echo "::error::$((TOT - OK)) vidéo(s) en échec — voir le tableau du bilan."; exit 1; }
+          [ "$BAD" = 0 ] || { echo "::error::$BAD étape(s) en échec — voir le tableau du bilan."; exit 1; }
