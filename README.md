@@ -36,7 +36,7 @@ Lancement manuel uniquement, aucune exécution automatique.
 - **Une phrase dont la voix échoue est sautée** (son sous-titre reste) au lieu de faire planter la vidéo.
 - **Contrôle final** : la durée et le son de la vidéo produite sont vérifiés avant publication.
 - **Traçable** : chaque job affiche un tableau (langue détectée, phrases, accélérations, retards, durée de chaque étape, avertissements). Un **Bilan** récapitule toutes les vidéos à la fin du run. Le rapport détaillé `rapport_….json` et une copie de la vidéo sont dans les artefacts du run pendant 7 jours.
-- **Refus clairs** : vidéo sans son, muette, corrompue, sans parole ou de plus de 15 min → message d'erreur qui dit quoi faire.
+- **Refus clairs** : vidéo sans son, muette, corrompue, sans parole ou de plus de 45 min → message d'erreur qui dit quoi faire.
 - **Fichier transcription** : ses deux premières lignes indiquent la langue retenue (et les langues comparées en cas de doute) et la voix choisie.
 - Les anciens résultats d'une vidéo retraitée sont remplacés ; les fichiers devenus obsolètes sont supprimés de la release.
 

@@ -121,7 +121,14 @@ jobs:
           [ -z "$BROKEN" ] || echo "::warning::Vidéo(s) mal envoyée(s), ignorée(s) : $BROKEN"
           jq -c '[.[] | select(.state=="uploaded" and .size>0)]' list.json > ok.json
           TOTAL=$(jq length ok.json)
-          [ "$TOTAL" -gt 0 ] || { echo "::error::Aucune vidéo à traduire dans la release « $TAG »."; exit 1; }
+          if [ "$TOTAL" -eq 0 ]; then
+            if [ -n "$BROKEN" ]; then
+              echo "::error::La vidéo n'est pas encore entièrement envoyée dans la release « $TAG » ($BROKEN). Attends la fin de l'envoi puis relance."
+            else
+              echo "::error::Aucune vidéo dans la release « $TAG ». Si tu viens de l'envoyer, attends la fin de l'envoi (la vidéo doit apparaître dans la liste des fichiers de la release) puis relance."
+            fi
+            exit 1
+          fi
           N=$(echo "$IN_N" | tr -d ' ' | tr 'A-Z' 'a-z')
           case "$N" in toutes|tout|all|"") N=$TOTAL ;; esac
           [ "$N" -ge 1 ] || N=1
@@ -144,7 +151,7 @@ jobs:
     needs: lister
     name: "Traduire : ${{ matrix.name }}"
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 355
     strategy:
       fail-fast: false
       max-parallel: 20
@@ -224,7 +231,7 @@ jobs:
           echo "file=$F" >> "$GITHUB_OUTPUT"
 
       - name: Traduire (transcription → traduction → voix off → montage)
-        timeout-minutes: 140
+        timeout-minutes: 330
         env:
           IN_VIDEO: ${{ steps.get.outputs.file }}
           IN_LANGS: ${{ inputs.langues }}

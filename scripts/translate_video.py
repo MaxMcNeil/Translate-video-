@@ -25,6 +25,7 @@ import numpy as np
 import soundfile as sf
 
 SR = 48000
+MAX_DUR = 45 * 60   # durée maximale acceptée (s)
 ROOT = Path(__file__).resolve().parent.parent
 MODELS = ROOT / "models"
 PIPER_BIN = MODELS / "piper" / "piper" / "piper"
@@ -216,9 +217,22 @@ def transcribe(video, work, model_size, src):
         model_size, device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 2,
         local_files_only=local))
 
-    def one_pass(lang):
+    # Vidéo longue : la langue est choisie sur un extrait représentatif (3 × 80 s pris à 20 %, 50 %
+    # et 80 % de la vidéo), puis la vidéo ENTIÈRE est transcrite une seule fois dans cette langue.
+    # → même qualité de transcription, sans transcrire 2 ou 3 fois une vidéo de 30 min.
+    total = a.size / 16000
+    probe_wav = wav
+    if total > 300:
+        win = 80 * 16000
+        parts = [a[max(0, int(f * a.size) - win // 2):][:win] for f in (0.2, 0.5, 0.8)]
+        probe_wav = work / "lang_probe16.wav"
+        sf.write(probe_wav, np.concatenate(parts), 16000)
+        log(f"Vidéo de {total / 60:.0f} min : langue détectée sur un extrait de 4 min réparti sur toute la vidéo")
+    del a
+
+    def one_pass(lang, path=None):
         segs, info = model.transcribe(
-            str(wav), language=lang, vad_filter=True, word_timestamps=True, beam_size=5,
+            str(path or wav), language=lang, vad_filter=True, word_timestamps=True, beam_size=5,
             condition_on_previous_text=False)
         words, dropped, lps = [], 0, []
         for s in segs:
@@ -239,8 +253,9 @@ def transcribe(video, work, model_size, src):
     if src != "auto":
         best = one_pass(src)
         prob, cands, tried = 1.0, [(src, 1.0)], {}
+        first = best
     else:
-        first = one_pass(None)
+        first = one_pass(None, probe_wav)
         probs = dict(first["info"].all_language_probs or [(first["lang"], 1.0)])
         probs.setdefault(first["lang"], float(first["info"].language_probability or 0))
         ranked = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)
@@ -257,7 +272,7 @@ def transcribe(video, work, model_size, src):
                 extra.append("en")
             for l in extra:
                 if l not in tried:
-                    tried[l] = one_pass(l)
+                    tried[l] = one_pass(l, probe_wav)
         for r in tried.values():   # petit avantage aux langues courantes
             r["final"] = r["score"] + (0.1 if r["lang"] in COMMON_LANGS else 0.0)
         best = max(tried.values(), key=lambda r: r["final"])
@@ -268,6 +283,9 @@ def transcribe(video, work, model_size, src):
         if best["lang"] != first["lang"]:
             warn(f"Langue corrigée : Whisper proposait « {first['lang']} », retenu « {best['lang']} » "
                  "(transcription nettement meilleure).")
+        if probe_wav != wav:
+            log(f"Transcription complète en « {best['lang']} »…")
+            best = one_pass(best["lang"])
     words, lang, dropped = best["words"], best["lang"], best["dropped"]
     REPORT.update(langue_source=lang, langue_source_proba=round(prob, 2), langue_source_mode=src,
                   langues_candidates=[[l, round(p, 2)] for l, p in cands],
@@ -613,7 +631,7 @@ def build_dub(segs, texts, models, video_dur, work):
 
 
 # ------------------------------------------------- séparation voix / musique
-def separate(video, work):
+def separate(video, work, dur=300.0):
     """Isole la voix (Demucs htdemucs) : la musique de fond n'est JAMAIS gardée.
     Retourne (voix.wav, infos). En cas d'échec : (None, infos) → voix d'origine coupée."""
     full = work / "orig44.wav"
@@ -623,9 +641,10 @@ def separate(video, work):
     cmd = [sys.executable, "-m", "demucs", "--two-stems=vocals", "-n", "htdemucs",
            "-o", str(sep), "--filename", "{stem}.{ext}", str(full)]
     err = ""
+    sep_timeout = int(max(1800, dur * 4))   # ≥ 30 min, 4 × la durée de la vidéo
     for attempt in range(2):
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=2700)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=sep_timeout)
             err = (r.stderr or "")[-600:]
             voc, acc = sep / "htdemucs" / "vocals.wav", sep / "htdemucs" / "no_vocals.wav"
             if r.returncode == 0 and voc.exists() and voc.stat().st_size > 10000:
@@ -641,7 +660,7 @@ def separate(video, work):
                     f"({ratio_db:+.0f} dB par rapport à la voix)")
                 return voc, info
         except subprocess.TimeoutExpired:
-            err = "délai dépassé (45 min)"
+            err = f"délai dépassé ({sep_timeout // 60} min)"
         log(f"Séparation : essai {attempt + 1} raté ({err.strip()[-300:]})")
     warn("Séparation voix/musique impossible : par sécurité, la voix d'origine est COUPÉE "
          "(aucune musique ne peut passer). La traduction continue normalement.")
@@ -842,6 +861,15 @@ def video_filter(geo, lay, ass_name):
     )
 
 
+def max_kbps(geo):
+    """Débit vidéo max : ~6 Mb/s en 1080p, proportionnel à la taille d'image ; réduit si la vidéo
+    est très longue pour que le fichier reste sous 1,8 Go."""
+    px = geo["w"] * geo["h"]
+    k = int(6000 * px / (1920 * 1080)) + 800
+    budget = int(1.8e9 * 8 / 1000 / max(geo["dur"], 1)) - 200   # kb/s disponibles (son 192k compris)
+    return max(min(k, budget, 8000), 600)
+
+
 def render(video, dub, orig_voice, ass, geo, lay, orig_vol, out):
     inputs = ["-i", Path(video).resolve(), "-i", Path(dub).resolve()]
     a = "[1:a]loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000[d]"
@@ -857,6 +885,8 @@ def render(video, dub, orig_voice, ass, geo, lay, orig_vol, out):
            "-filter_complex", f"{video_filter(geo, lay, ass.name)};{a}",
            "-map", "[v]", "-map", "[a]",
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+           # plafond de débit : qualité identique à l'œil, fichier toujours sous 2 Go (limite des releases)
+           "-maxrate", f"{max_kbps(geo)}k", "-bufsize", f"{2 * max_kbps(geo)}k",
            "-c:a", "aac", "-b:a", "192k", "-t", f"{geo['dur']:.3f}",
            "-movflags", "+faststart", Path(out).resolve()]
     run(cmd, cwd=ass.parent)
@@ -951,15 +981,16 @@ def main():
         log(f"Vidéo {geo['w']}x{geo['h']}, {geo['dur']:.1f} s, codec {geo['vcodec']}, son={geo['audio']}")
         if not geo["audio"]:
             fail("la vidéo n'a pas de son : rien à traduire.")
+        if geo["dur"] > MAX_DUR:
+            fail(f"vidéo de {geo['dur'] / 60:.0f} min : limite de {MAX_DUR // 60} min (au-delà, le traitement "
+                 "dépasserait les 6 h maximum d'un job GitHub). Coupe-la en plusieurs parties.")
         if geo["dur"] > 900:
-            fail(f"vidéo de {geo['dur'] / 60:.0f} min : limite fixée à 15 min pour rester fiable.")
-        if geo["dur"] > 420:
-            warn(f"Vidéo de {geo['dur'] / 60:.1f} min (plus de 7 min) : traitement plus long.")
+            log(f"Vidéo longue ({geo['dur'] / 60:.0f} min) : compter environ {geo['dur'] / 60 * 4:.0f} min de traitement.")
         work = Path("work").resolve() / stem
         work.mkdir(parents=True, exist_ok=True)
 
         stage("2. Séparation voix / musique (Demucs)")
-        vocals, sep_info = separate(video, work)
+        vocals, sep_info = separate(video, work, geo["dur"])
         REPORT.update(sep_info)
 
         stage("3. Transcription (Whisper)")
