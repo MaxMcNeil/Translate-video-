@@ -60,7 +60,24 @@ env:
   PYTHONUNBUFFERED: "1"
 
 jobs:
+  test_setup:   # TEST UNIQUEMENT : fabrique la release de test (brouillon)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - run: |
+          sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+          gh release delete test-decoupe -R "$GITHUB_REPOSITORY" -y --cleanup-tag || true
+          gh release download To_translate -R "$GITHUB_REPOSITORY" --pattern "Jeffrey*.mp4" --dir v
+          F=$(ls v/*.mp4 | head -1)
+          ffmpeg -v error -ss 60 -t 120 -i "$F" -c copy "v/court test.mp4"
+          gh release create test-decoupe -R "$GITHUB_REPOSITORY" --draft --target test-decoupe \
+            --title "TEST découpage (à supprimer)" --notes "test" "v/court test.mp4" "$F"
+          gh release view test-decoupe -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name'
+
   lister:
+    needs: test_setup
     name: "Vérifier les champs et lister les vidéos"
     runs-on: ubuntu-24.04
     timeout-minutes: 10
