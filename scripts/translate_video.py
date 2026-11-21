@@ -551,8 +551,8 @@ def voice_model(lang, gender):
             for f in (onnx, cfg):           # fichier abîmé ou incompatible : retiré, pour ne pas le garder en cache
                 f.unlink(missing_ok=True)
     other = "femme" if gender == "homme" else "homme"
-    if VOICES[lang][other] != rel and (lang, other, "repli") not in _VOICE_OK:
-        _VOICE_OK[(lang, other, "repli")] = True
+    if VOICES[lang][other] != rel and (lang, "repli") not in _VOICE_OK:
+        _VOICE_OK[(lang, "repli")] = True
         try:
             m = voice_model(lang, other)
             warn(f"Voix {lang} {gender} inutilisable ({' | '.join(errs)}) : voix {other} utilisée à la place.")
@@ -1217,7 +1217,7 @@ def main():
         for l in langs:
             for g in (["homme", "femme"] if a.voice in ("auto", "par-phrase") else [a.voice]):
                 voice_model(l, g)
-        log("Voix off : " + ", ".join(sorted({f"{k[0]} {k[1]}" for k in _VOICE_OK if len(k) == 2})) + " testées et prêtes")
+        log("Voix off : " + ", ".join(sorted({f"{k[0]} {k[1]}" for k in _VOICE_OK if len(k) == 2 and k[1] in ("homme", "femme")})) + " testées et prêtes")
         if not video.exists() or video.stat().st_size == 0:
             fail("vidéo absente ou vide.")
         geo = probe(video)
