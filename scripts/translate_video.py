@@ -34,7 +34,13 @@ ROOT = Path(__file__).resolve().parent.parent
 MODELS = ROOT / "models"
 PIPER_BIN = MODELS / "piper" / "piper" / "piper"
 VOICES_DIR = MODELS / "voices"
-VOICE_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+VOICE_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/{rev}/"
+# Versions de la bibliothèque de voix essayées dans l'ordre : d'abord la version figée v1.0.0 (format connu de ce moteur,
+# insensible aux mises à jour extérieures), puis la version du jour (rendue compatible). Chaque voix est ESSAYÉE (une phrase
+# de test) avant d'être utilisée : une voix qui ne parle pas n'est jamais retenue.
+VOICE_REVS = [r for r in os.environ.get("TV_VOICE_REVS", "v1.0.0,main").split(",") if r.strip()]
+VOICE_TEST = {"fr": "Bonjour, ceci est un essai.", "it": "Buongiorno, questa è una prova.",
+              "en": "Hello, this is a test.", "ar": "مرحبا، هذا اختبار."}
 NLLB_MODEL = "facebook/nllb-200-distilled-600M"
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi"}
 
@@ -144,7 +150,7 @@ def retry(what, fn, tries=4):
             time.sleep(15 * (i + 1))
 
 
-def fetch(url, dest: Path):
+def fetch(url, dest: Path, tries=6):
     if dest.exists() and dest.stat().st_size > 0:
         return
 
@@ -157,7 +163,7 @@ def fetch(url, dest: Path):
         if tmp.stat().st_size == 0:
             raise RuntimeError("fichier vide")
         tmp.rename(dest)
-    retry(f"téléchargement {dest.name}", _dl, tries=6)
+    retry(f"téléchargement {dest.name}", _dl, tries=tries)
 
 
 def hf_load(what, fn):
@@ -514,14 +520,47 @@ def assign_voices(vocals, work, segs, forced):
 
 
 # ------------------------------------------------------------------- voix
+_VOICE_OK = {}
+
+
 def voice_model(lang, gender):
+    """Voix Piper qui PARLE vraiment : essayée sur une phrase de test, sinon autre version de la bibliothèque, sinon l'autre
+    voix de la même langue (avec un avertissement), sinon arrêt clair dès le début (jamais après la longue transcription)."""
+    key = (lang, gender)
+    if key in _VOICE_OK:
+        return _VOICE_OK[key]
     rel = VOICES[lang][gender]
-    onnx = VOICES_DIR / (Path(rel).name + ".onnx")
-    fetch(VOICE_URL + rel + ".onnx", onnx)
-    cfg = Path(str(onnx) + ".json")
-    fetch(VOICE_URL + rel + ".onnx.json", cfg)
-    compat_piper(cfg)
-    return onnx
+    errs = []
+    for rev in VOICE_REVS:
+        d = VOICES_DIR / re.sub(r"[^\w.-]+", "_", rev)
+        onnx = d / (Path(rel).name + ".onnx")
+        cfg = Path(str(onnx) + ".json")
+        try:
+            fetch(VOICE_URL.format(rev=rev) + rel + ".onnx", onnx, tries=3)
+            fetch(VOICE_URL.format(rev=rev) + rel + ".onnx.json", cfg, tries=3)
+            compat_piper(cfg)
+            test = d / f"_test_{lang}_{gender}.wav"
+            piper(clean_for_tts(VOICE_TEST.get(lang, "Test.")), onnx, test, 1.0)
+            test.unlink(missing_ok=True)
+            if rev != VOICE_REVS[0]:
+                log(f"Voix {lang} {gender} : prise dans la version « {rev} » de la bibliothèque (la précédente ne marchait pas)")
+            _VOICE_OK[key] = onnx
+            return onnx
+        except Exception as e:
+            errs.append(f"{rev} : {str(e)[-160:]}")
+            for f in (onnx, cfg):           # fichier abîmé ou incompatible : retiré, pour ne pas le garder en cache
+                f.unlink(missing_ok=True)
+    other = "femme" if gender == "homme" else "homme"
+    if VOICES[lang][other] != rel and (lang, other, "repli") not in _VOICE_OK:
+        _VOICE_OK[(lang, other, "repli")] = True
+        try:
+            m = voice_model(lang, other)
+            warn(f"Voix {lang} {gender} inutilisable ({' | '.join(errs)}) : voix {other} utilisée à la place.")
+            _VOICE_OK[key] = m
+            return m
+        except Fatal:
+            pass
+    fail(f"aucune voix {lang} ne fonctionne ({' | '.join(errs)}). Rien n'a été publié.")
 
 
 def compat_piper(cfg: Path):
@@ -1174,6 +1213,11 @@ def main():
             fail("le volume d'origine doit être entre 0 et 1 (ex. 0.05).")
         if not PIPER_BIN.exists():
             fail("moteur de voix Piper absent (étape d'installation ratée).")
+        # répétition générale des voix AVANT le long travail (séparation, transcription) : un problème de voix est vu en 1 minute
+        for l in langs:
+            for g in (["homme", "femme"] if a.voice in ("auto", "par-phrase") else [a.voice]):
+                voice_model(l, g)
+        log("Voix off : " + ", ".join(sorted({f"{k[0]} {k[1]}" for k in _VOICE_OK if len(k) == 2})) + " testées et prêtes")
         if not video.exists() or video.stat().st_size == 0:
             fail("vidéo absente ou vide.")
         geo = probe(video)
