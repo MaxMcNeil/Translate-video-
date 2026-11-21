@@ -518,8 +518,27 @@ def voice_model(lang, gender):
     rel = VOICES[lang][gender]
     onnx = VOICES_DIR / (Path(rel).name + ".onnx")
     fetch(VOICE_URL + rel + ".onnx", onnx)
-    fetch(VOICE_URL + rel + ".onnx.json", Path(str(onnx) + ".json"))
+    cfg = Path(str(onnx) + ".json")
+    fetch(VOICE_URL + rel + ".onnx.json", cfg)
+    compat_piper(cfg)
     return onnx
+
+
+def compat_piper(cfg: Path):
+    """Les fiches des voix Piper (piper-voices, branche main) ont été mises à jour pour le nouveau Piper : elles listent
+    aussi des sons écrits en plusieurs caractères (« aɪ »…), que le moteur Piper installé ici refuse (« is not a single
+    codepoint ») → plus aucune phrase doublée. Ces sons ne sont jamais produits par ce moteur : on les retire de la fiche,
+    les sons d'un seul caractère gardent exactement leurs numéros, donc la voix reste identique."""
+    try:
+        j = json.loads(cfg.read_text(encoding="utf-8"))
+        m = j.get("phoneme_id_map") or {}
+        bad = [k for k in m if len(k) != 1]
+        if bad:
+            j["phoneme_id_map"] = {k: v for k, v in m.items() if len(k) == 1}
+            cfg.write_text(json.dumps(j, ensure_ascii=False), encoding="utf-8")
+            log(f"Voix {cfg.name} : {len(bad)} son(s) du nouveau format retiré(s) pour rester compatible avec le moteur Piper")
+    except Exception as e:
+        warn(f"Fiche de voix {cfg.name} illisible ({e}) : gardée telle quelle.")
 
 
 def clean_for_tts(text):
